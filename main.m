@@ -2,6 +2,79 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 
+#pragma mark - SegmentResourceLoader
+
+@interface SegmentResourceLoader : NSObject <AVAssetResourceLoaderDelegate>
+@property (nonatomic, strong) NSURL *url;
+@property (nonatomic, strong) NSMutableArray *pendingRequests;
+@property (nonatomic, assign) NSUInteger segmentSize;
+@property (nonatomic, strong) NSURLSession *session;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber*, NSData*> *segmentCache;
+@end
+
+@implementation SegmentResourceLoader
+
+- (instancetype)initWithURL:(NSURL *)url segmentSize:(NSUInteger)size {
+    if (self = [super init]) {
+        self.url = url;
+        self.segmentSize = size;
+        self.pendingRequests = [NSMutableArray array];
+        self.segmentCache = [NSMutableDictionary dictionary];
+        self.session = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]];
+    }
+    return self;
+}
+
+- (BOOL)resourceLoader:(AVAssetResourceLoader *)resourceLoader
+shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loadingRequest {
+    
+    @synchronized(self) {
+        [self.pendingRequests addObject:loadingRequest];
+        [self processRequest:loadingRequest];
+    }
+    return YES;
+}
+
+- (void)processRequest:(AVAssetResourceLoadingRequest *)loadingRequest {
+    long long offset = loadingRequest.dataRequest.requestedOffset;
+    NSNumber *segmentIndex = @(offset / self.segmentSize);
+    
+    NSData *segmentData = self.segmentCache[segmentIndex];
+    if (segmentData) {
+        [loadingRequest.dataRequest respondWithData:segmentData];
+        [loadingRequest finishLoading];
+        [self.pendingRequests removeObject:loadingRequest];
+        return;
+    }
+    
+    long long start = segmentIndex.longLongValue * self.segmentSize;
+    long long end = start + self.segmentSize - 1;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:self.url];
+    NSString *range = [NSString stringWithFormat:@"bytes=%lld-%lld", start, end];
+    [req setValue:range forHTTPHeaderField:@"Range"];
+    
+    NSURLSessionDataTask *task = [self.session dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+        if (data) {
+            @synchronized(self) {
+                self.segmentCache[segmentIndex] = data;
+                [loadingRequest.dataRequest respondWithData:data];
+                [loadingRequest finishLoading];
+                [self.pendingRequests removeObject:loadingRequest];
+                
+                // 保持缓存最多 5 段
+                while (self.segmentCache.count > 5) {
+                    [self.segmentCache removeObjectForKey:[[self.segmentCache allKeys] firstObject]];
+                }
+            }
+        }
+    }];
+    [task resume];
+}
+
+@end
+
+#pragma mark - PlayerView
+
 @interface PlayerView : NSView
 @property (nonatomic, strong) NSURL *videoURL;
 @end
@@ -12,27 +85,18 @@
     NSSlider *progressSlider;
     NSTrackingArea *trackingArea;
     id timeObserverToken;
-    id <NSObject> sleepActivity; // 用来保持系统唤醒（听歌时）
+    id <NSObject> sleepActivity;
 }
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
     if (self) {
         player = [[AVPlayer alloc] init];
-        
-        // 1. 默认先不阻止屏幕休眠，等检测到有视频画面再说
-        player.preventsDisplaySleepDuringVideoPlayback = NO; 
-        
-        // 2. 依然创建 Layer，因为可能随时切换到视频文件
         playerLayer = [AVPlayerLayer playerLayerWithPlayer:player];
         playerLayer.videoGravity = AVLayerVideoGravityResizeAspect;
-        
         self.layer = playerLayer;
         self.wantsLayer = YES;
-        
         [self setupUI];
-        
-        // 3. 监听当前 Item 变化，以便检测是否包含视频轨
         [player addObserver:self forKeyPath:@"currentItem.tracks" options:NSKeyValueObservingOptionNew context:nil];
     }
     return self;
@@ -44,52 +108,7 @@
     [self endSystemSleepActivity];
 }
 
-// 4. 核心逻辑：智能判断是“看视频”还是“听音乐”
-- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
-    if ([keyPath isEqualToString:@"currentItem.tracks"]) {
-        NSArray *tracks = player.currentItem.tracks;
-        BOOL hasVideo = NO;
-        for (AVPlayerItemTrack *track in tracks) {
-            if ([track.assetTrack.mediaType isEqualToString:AVMediaTypeVideo]) {
-                hasVideo = YES;
-                break;
-            }
-        }
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (hasVideo) {
-                // 是视频：阻止屏幕休眠，释放系统休眠锁（AVPlayer 会自动接管）
-                self->player.preventsDisplaySleepDuringVideoPlayback = YES;
-                [self endSystemSleepActivity];
-                NSLog(@"Mode: Video (Keep Display Awake)");
-            } else {
-                // 是音频：允许屏幕休眠，但手动申请系统不休眠
-                self->player.preventsDisplaySleepDuringVideoPlayback = NO;
-                [self beginSystemSleepActivity];
-                NSLog(@"Mode: Audio (Allow Display Sleep, Prevent System Sleep)");
-            }
-        });
-    } else {
-        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
-    }
-}
-
-// 手动申请“防止系统睡眠”，让音乐在屏幕关闭后继续播放
-- (void)beginSystemSleepActivity {
-    if (!sleepActivity) {
-        NSActivityOptions options = NSActivityUserInitiated | NSActivityLatencyCritical; 
-        sleepActivity = [[NSProcessInfo processInfo] beginActivityWithOptions:options reason:@"Playing Audio"];
-    }
-}
-
-- (void)endSystemSleepActivity {
-    if (sleepActivity) {
-        [[NSProcessInfo processInfo] endActivity:sleepActivity];
-        sleepActivity = nil;
-    }
-}
-
-// --- 以下 UI 和控制逻辑保持不变 ---
+#pragma mark - UI
 
 - (void)setupUI {
     progressSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(20, 10, self.bounds.size.width - 40, 20)];
@@ -108,14 +127,13 @@
 - (void)keyDown:(NSEvent *)event {
     unsigned short keyCode = [event keyCode];
     NSString *chars = [event charactersIgnoringModifiers];
-
     if ([chars isEqualToString:@"q"]) {
         [NSApp terminate:nil];
-    } else if (keyCode == 36) { // Enter
+    } else if (keyCode == 36) {
         [self.window toggleFullScreen:nil];
-    } else if (keyCode == 123) { // Left
+    } else if (keyCode == 123) {
         [self seekBySeconds:-10.0];
-    } else if (keyCode == 124) { // Right
+    } else if (keyCode == 124) {
         [self seekBySeconds:10.0];
     } else {
         [super keyDown:event];
@@ -138,18 +156,67 @@
         [[progressSlider animator] setAlphaValue:0.0];
     }
 }
+
 - (void)mouseExited:(NSEvent *)event {
     [[progressSlider animator] setAlphaValue:0.0];
 }
 
+#pragma mark - System Sleep
+
+- (void)beginSystemSleepActivity {
+    if (!sleepActivity) {
+        NSActivityOptions options = NSActivityUserInitiated | NSActivityLatencyCritical;
+        sleepActivity = [[NSProcessInfo processInfo] beginActivityWithOptions:options reason:@"Playing Audio"];
+    }
+}
+
+- (void)endSystemSleepActivity {
+    if (sleepActivity) {
+        [[NSProcessInfo processInfo] endActivity:sleepActivity];
+        sleepActivity = nil;
+    }
+}
+
+#pragma mark - AVPlayer Observation
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    if ([keyPath isEqualToString:@"currentItem.tracks"]) {
+        NSArray *tracks = player.currentItem.tracks;
+        BOOL hasVideo = NO;
+        for (AVPlayerItemTrack *track in tracks) {
+            if ([track.assetTrack.mediaType isEqualToString:AVMediaTypeVideo]) {
+                hasVideo = YES;
+                break;
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (hasVideo) {
+                self->player.preventsDisplaySleepDuringVideoPlayback = YES;
+                [self endSystemSleepActivity];
+            } else {
+                self->player.preventsDisplaySleepDuringVideoPlayback = NO;
+                [self beginSystemSleepActivity];
+            }
+        });
+    } else {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+    }
+}
+
+#pragma mark - Video Playback
+
 - (void)setVideoURL:(NSURL *)videoURL {
     _videoURL = videoURL;
-    if (player) {
-        AVPlayerItem *item = [AVPlayerItem playerItemWithURL:videoURL];
-        [player replaceCurrentItemWithPlayerItem:item];
-        [self setupTimeObserver];
-        [player play];
-    }
+    
+    SegmentResourceLoader *loader = [[SegmentResourceLoader alloc] initWithURL:videoURL segmentSize:1024*1024]; // 1MB 段
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:videoURL options:nil];
+    [asset.resourceLoader setDelegate:loader queue:dispatch_get_main_queue()];
+    
+    AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:asset];
+    item.preferredForwardBufferDuration = 2.0; // 仅缓冲 2 秒
+    [player replaceCurrentItemWithPlayerItem:item];
+    [self setupTimeObserver];
+    [player play];
 }
 
 - (void)setupTimeObserver {
@@ -157,7 +224,7 @@
         [player removeTimeObserver:timeObserverToken];
         timeObserverToken = nil;
     }
-    __weak PlayerView *weakSelf = self;
+    __weak typeof(self) weakSelf = self;
     timeObserverToken = [player addPeriodicTimeObserverForInterval:CMTimeMake(1, 2)
                                                              queue:dispatch_get_main_queue()
                                                         usingBlock:^(CMTime time) {
@@ -168,7 +235,6 @@
 - (void)syncSlider {
     NSEvent *event = [NSApp currentEvent];
     if (event.type == NSEventTypeLeftMouseDragged) return;
-
     if (player.currentItem.status == AVPlayerItemStatusReadyToPlay) {
         double current = CMTimeGetSeconds(player.currentTime);
         double duration = CMTimeGetSeconds(player.currentItem.duration);
@@ -194,43 +260,37 @@
 
 @end
 
+#pragma mark - main
+
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
         if (argc < 2) {
             fprintf(stderr, "Usage: %s <path/to/media_file_or_url>\n", argv[0]);
             return 1;
         }
-        
+
         NSString *inputArg = [NSString stringWithUTF8String:argv[1]];
         NSURL *url = nil;
-        
-        // --- 核心修改部分 ---
-        // 检查参数是否以 http:// 或 https:// 开头
         if ([inputArg hasPrefix:@"http://"] || [inputArg hasPrefix:@"https://"]) {
             url = [NSURL URLWithString:inputArg];
         } else {
-            // 如果不是网络链接，则作为本地文件路径处理
             url = [NSURL fileURLWithPath:inputArg];
         }
-        // ------------------
 
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
 
-        NSWindow *window = [[NSWindow alloc]
-            initWithContentRect:NSMakeRect(0, 0, 960, 540)
-                      styleMask:(NSWindowStyleMaskTitled |
-                                 NSWindowStyleMaskClosable |
-                                 NSWindowStyleMaskResizable |
-                                 NSWindowStyleMaskMiniaturizable)
-                        backing:NSBackingStoreBuffered
-                          defer:NO];
-        
+        NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 960, 540)
+                                                       styleMask:(NSWindowStyleMaskTitled |
+                                                                  NSWindowStyleMaskClosable |
+                                                                  NSWindowStyleMaskResizable |
+                                                                  NSWindowStyleMaskMiniaturizable)
+                                                         backing:NSBackingStoreBuffered
+                                                           defer:NO];
+
         [window setTitle:[[url lastPathComponent] stringByDeletingPathExtension]];
         [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
         [window setAcceptsMouseMovedEvents:YES];
-        
-        // 视频优化：P3 色域
         [window setColorSpace:[NSColorSpace displayP3ColorSpace]];
 
         PlayerView *view = [[PlayerView alloc] initWithFrame:window.contentView.bounds];
@@ -241,7 +301,6 @@ int main(int argc, const char * argv[]) {
         [window makeFirstResponder:view];
         [window makeKeyAndOrderFront:nil];
         [app activateIgnoringOtherApps:YES];
-
         [app run];
     }
     return 0;
