@@ -197,12 +197,22 @@
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
         if (argc < 2) {
-            fprintf(stderr, "Usage: %s <path/to/media_file>\n", argv[0]);
+            fprintf(stderr, "Usage: %s <path/to/media_file_or_url>\n", argv[0]);
             return 1;
         }
         
-        // 使用 fileURLWithPath 自动处理绝对/相对路径
-        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[1]]];
+        NSString *inputArg = [NSString stringWithUTF8String:argv[1]];
+        NSURL *url = nil;
+        
+        // --- 核心修改部分 ---
+        // 检查参数是否以 http:// 或 https:// 开头
+        if ([inputArg hasPrefix:@"http://"] || [inputArg hasPrefix:@"https://"]) {
+            url = [NSURL URLWithString:inputArg];
+        } else {
+            // 如果不是网络链接，则作为本地文件路径处理
+            url = [NSURL fileURLWithPath:inputArg];
+        }
+        // ------------------
 
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
