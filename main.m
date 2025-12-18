@@ -10,19 +10,24 @@
     AVPlayerLayer *layer;
 }
 
-// 1. 允许 View 接收键盘事件 (必须返回 YES)
+// 1. 允许接收键盘事件
 - (BOOL)acceptsFirstResponder {
     return YES;
 }
 
-// 2. 监听按键按下事件
+// 2. 监听按键
 - (void)keyDown:(NSEvent *)event {
-    // 36 是回车键 (Return) 的 KeyCode
-    if (event.keyCode == 36) {
-        // 调用窗口的 toggleFullScreen 方法
+    NSString *chars = [event charactersIgnoringModifiers];
+    
+    // 检测 'q' 键退出
+    if ([chars isEqualToString:@"q"]) {
+        [NSApp terminate:nil];
+    } 
+    // 检测回车键 (Key Code 36) 全屏
+    else if (event.keyCode == 36) {
         [self.window toggleFullScreen:nil];
-    } else {
-        // 其他按键交还给系统处理（比如系统提示音）
+    } 
+    else {
         [super keyDown:event];
     }
 }
@@ -36,7 +41,7 @@
     player = [AVPlayer playerWithURL:self.videoURL];
 
     layer = [AVPlayerLayer playerLayerWithPlayer:player];
-    layer.videoGravity = AVLayerVideoGravityResizeAspect; // 保持比例
+    layer.videoGravity = AVLayerVideoGravityResizeAspect;
     layer.frame = self.bounds;
 
     self.wantsLayer = YES;
@@ -48,7 +53,6 @@
 - (void)setFrameSize:(NSSize)newSize {
     [super setFrameSize:newSize];
     if (layer) {
-        // 确保全屏切换时，视频层也能跟随调整大小
         layer.frame = self.bounds;
     }
 }
@@ -68,19 +72,16 @@ int main(int argc, const char * argv[]) {
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
 
-        // 创建窗口
         NSWindow *window = [[NSWindow alloc]
             initWithContentRect:NSMakeRect(0, 0, 960, 540)
                       styleMask:(NSWindowStyleMaskTitled |
                                  NSWindowStyleMaskClosable |
-                                 NSWindowStyleMaskResizable | // 必须可调整大小才能全屏
-                                 NSWindowStyleMaskMiniaturizable) 
+                                 NSWindowStyleMaskResizable |
+                                 NSWindowStyleMaskMiniaturizable)
                         backing:NSBackingStoreBuffered
                           defer:NO];
         
         [window setTitle:[filePath lastPathComponent]];
-        
-        // 3. 设置窗口行为，支持全屏
         [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
 
         PlayerView *view = [[PlayerView alloc]
@@ -91,7 +92,7 @@ int main(int argc, const char * argv[]) {
 
         window.contentView = view;
         
-        // 4. 让 View 成为第一响应者，以便立即接收键盘事件
+        // 确保 View 获得焦点以响应键盘
         [window makeFirstResponder:view];
         
         [window makeKeyAndOrderFront:nil];
