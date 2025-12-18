@@ -2,58 +2,112 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 
-// --- 自定义 Slider 以优化点击体验 (可选，这里直接用原生 NSSlider) ---
-
 @interface PlayerView : NSView
 @property (nonatomic, strong) NSURL *videoURL;
 @end
 
 @implementation PlayerView {
     AVPlayer *player;
-    AVPlayerLayer *layer;
-    NSSlider *progressSlider;     // 进度条
-    NSTrackingArea *trackingArea; // 鼠标追踪区域
-    id timeObserverToken;         // 时间监听器句柄
-    BOOL isUserDragging;          // 标记用户是否正在拖动滑块
+    AVPlayerLayer *playerLayer;
+    NSSlider *progressSlider;
+    NSTrackingArea *trackingArea;
+    id timeObserverToken;
+    id <NSObject> sleepActivity; // 用来保持系统唤醒（听歌时）
 }
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
     if (self) {
+        player = [[AVPlayer alloc] init];
+        
+        // 1. 默认先不阻止屏幕休眠，等检测到有视频画面再说
+        player.preventsDisplaySleepDuringVideoPlayback = NO; 
+        
+        // 2. 依然创建 Layer，因为可能随时切换到视频文件
+        playerLayer = [AVPlayerLayer playerLayerWithPlayer:player];
+        playerLayer.videoGravity = AVLayerVideoGravityResizeAspect;
+        
+        self.layer = playerLayer;
+        self.wantsLayer = YES;
+        
         [self setupUI];
+        
+        // 3. 监听当前 Item 变化，以便检测是否包含视频轨
+        [player addObserver:self forKeyPath:@"currentItem.tracks" options:NSKeyValueObservingOptionNew context:nil];
     }
     return self;
 }
 
+- (void)dealloc {
+    [player removeObserver:self forKeyPath:@"currentItem.tracks"];
+    if (timeObserverToken) [player removeTimeObserver:timeObserverToken];
+    [self endSystemSleepActivity];
+}
+
+// 4. 核心逻辑：智能判断是“看视频”还是“听音乐”
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    if ([keyPath isEqualToString:@"currentItem.tracks"]) {
+        NSArray *tracks = player.currentItem.tracks;
+        BOOL hasVideo = NO;
+        for (AVPlayerItemTrack *track in tracks) {
+            if ([track.assetTrack.mediaType isEqualToString:AVMediaTypeVideo]) {
+                hasVideo = YES;
+                break;
+            }
+        }
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (hasVideo) {
+                // 是视频：阻止屏幕休眠，释放系统休眠锁（AVPlayer 会自动接管）
+                self->player.preventsDisplaySleepDuringVideoPlayback = YES;
+                [self endSystemSleepActivity];
+                NSLog(@"Mode: Video (Keep Display Awake)");
+            } else {
+                // 是音频：允许屏幕休眠，但手动申请系统不休眠
+                self->player.preventsDisplaySleepDuringVideoPlayback = NO;
+                [self beginSystemSleepActivity];
+                NSLog(@"Mode: Audio (Allow Display Sleep, Prevent System Sleep)");
+            }
+        });
+    } else {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+    }
+}
+
+// 手动申请“防止系统睡眠”，让音乐在屏幕关闭后继续播放
+- (void)beginSystemSleepActivity {
+    if (!sleepActivity) {
+        NSActivityOptions options = NSActivityUserInitiated | NSActivityLatencyCritical; 
+        sleepActivity = [[NSProcessInfo processInfo] beginActivityWithOptions:options reason:@"Playing Audio"];
+    }
+}
+
+- (void)endSystemSleepActivity {
+    if (sleepActivity) {
+        [[NSProcessInfo processInfo] endActivity:sleepActivity];
+        sleepActivity = nil;
+    }
+}
+
+// --- 以下 UI 和控制逻辑保持不变 ---
+
 - (void)setupUI {
-    // 初始化进度条
-    // 放在底部，高度 20
     progressSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(20, 10, self.bounds.size.width - 40, 20)];
     progressSlider.minValue = 0.0;
-    progressSlider.maxValue = 1.0; // 初始值，加载视频后会更新
-    progressSlider.doubleValue = 0.0;
+    progressSlider.maxValue = 1.0;
     progressSlider.target = self;
     progressSlider.action = @selector(sliderAction:);
-    
-    // 设置自动调整宽度，保持在底部
     progressSlider.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
-    
-    // 初始透明度为 0 (隐藏)
     progressSlider.alphaValue = 0.0;
-    progressSlider.wantsLayer = YES; // 开启 Layer 才能做透明度动画
-
+    progressSlider.wantsLayer = YES;
     [self addSubview:progressSlider];
 }
 
-// 1. 允许接收键盘事件
-- (BOOL)acceptsFirstResponder {
-    return YES;
-}
+- (BOOL)acceptsFirstResponder { return YES; }
 
-// 2. 键盘控制
 - (void)keyDown:(NSEvent *)event {
-    NSString *chars = [event charactersIgnoringModifiers];
     unsigned short keyCode = [event keyCode];
+    NSString *chars = [event charactersIgnoringModifiers];
 
     if ([chars isEqualToString:@"q"]) {
         [NSApp terminate:nil];
@@ -68,71 +122,42 @@
     }
 }
 
-// 3. 鼠标移动逻辑 (MPV 风格)
 - (void)updateTrackingAreas {
     [super updateTrackingAreas];
-    
-    if (trackingArea) {
-        [self removeTrackingArea:trackingArea];
-    }
-    
-    // 追踪整个视图的鼠标移动
-    NSTrackingAreaOptions options = NSTrackingMouseEnteredAndExited | 
-                                    NSTrackingMouseMoved | 
-                                    NSTrackingActiveInKeyWindow | 
-                                    NSTrackingActiveAlways;
-    
-    trackingArea = [[NSTrackingArea alloc] initWithRect:self.bounds
-                                                options:options
-                                                  owner:self
-                                               userInfo:nil];
+    if (trackingArea) [self removeTrackingArea:trackingArea];
+    NSTrackingAreaOptions options = NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved | NSTrackingActiveInKeyWindow | NSTrackingActiveAlways;
+    trackingArea = [[NSTrackingArea alloc] initWithRect:self.bounds options:options owner:self userInfo:nil];
     [self addTrackingArea:trackingArea];
 }
 
 - (void)mouseMoved:(NSEvent *)event {
-    // 获取鼠标在视图内的位置
     NSPoint mousePoint = [self convertPoint:[event locationInWindow] fromView:nil];
-    
-    // 如果鼠标在底部 80 像素区域内，显示进度条
     if (mousePoint.y < 80) {
         [[progressSlider animator] setAlphaValue:1.0];
     } else {
         [[progressSlider animator] setAlphaValue:0.0];
     }
 }
-
-// 鼠标移出视图时隐藏
 - (void)mouseExited:(NSEvent *)event {
     [[progressSlider animator] setAlphaValue:0.0];
 }
 
-
-// 4. 视频加载与同步
-- (void)viewDidMoveToWindow {
-    [super viewDidMoveToWindow];
-
-    if (!self.window || !self.videoURL) return;
-    if (player) return;
-
-    player = [AVPlayer playerWithURL:self.videoURL];
-
-    layer = [AVPlayerLayer playerLayerWithPlayer:player];
-    layer.videoGravity = AVLayerVideoGravityResizeAspect;
-    layer.frame = self.bounds;
-    
-    // 确保进度条在视频层上面
-    self.wantsLayer = YES;
-    [self.layer insertSublayer:layer atIndex:0]; // 放在最底层
-
-    [self setupTimeObserver];
-    [player play];
+- (void)setVideoURL:(NSURL *)videoURL {
+    _videoURL = videoURL;
+    if (player) {
+        AVPlayerItem *item = [AVPlayerItem playerItemWithURL:videoURL];
+        [player replaceCurrentItemWithPlayerItem:item];
+        [self setupTimeObserver];
+        [player play];
+    }
 }
 
-// 监听播放进度 -> 更新 Slider
 - (void)setupTimeObserver {
+    if (timeObserverToken) {
+        [player removeTimeObserver:timeObserverToken];
+        timeObserverToken = nil;
+    }
     __weak PlayerView *weakSelf = self;
-    
-    // 每 0.5 秒回调一次
     timeObserverToken = [player addPeriodicTimeObserverForInterval:CMTimeMake(1, 2)
                                                              queue:dispatch_get_main_queue()
                                                         usingBlock:^(CMTime time) {
@@ -141,16 +166,12 @@
 }
 
 - (void)syncSlider {
-    // 如果用户正在拖动，不要由视频进度来更新 Slider，防止冲突
-    NSEvent *currentEvent = [NSApp currentEvent];
-    if (currentEvent.type == NSEventTypeLeftMouseDragged) {
-        return;
-    }
+    NSEvent *event = [NSApp currentEvent];
+    if (event.type == NSEventTypeLeftMouseDragged) return;
 
     if (player.currentItem.status == AVPlayerItemStatusReadyToPlay) {
         double current = CMTimeGetSeconds(player.currentTime);
         double duration = CMTimeGetSeconds(player.currentItem.duration);
-        
         if (!isnan(duration) && duration > 0) {
             progressSlider.maxValue = duration;
             progressSlider.doubleValue = current;
@@ -158,36 +179,17 @@
     }
 }
 
-// 用户拖动 Slider -> 跳转视频
 - (void)sliderAction:(id)sender {
     if (player.status == AVPlayerStatusReadyToPlay) {
-        double newTime = [sender doubleValue];
-        CMTime time = CMTimeMakeWithSeconds(newTime, 1000);
-        
-        [player seekToTime:time toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+        [player seekToTime:CMTimeMakeWithSeconds([sender doubleValue], 1000)
+           toleranceBefore:kCMTimeZero
+            toleranceAfter:kCMTimeZero];
     }
 }
 
-// 辅助跳转方法（键盘用）
 - (void)seekBySeconds:(Float64)seconds {
-    if (!player) return;
-    CMTime currentTime = [player currentTime];
-    CMTime offset = CMTimeMakeWithSeconds(seconds, 1);
-    CMTime newTime = CMTimeAdd(currentTime, offset);
+    CMTime newTime = CMTimeAdd(player.currentTime, CMTimeMakeWithSeconds(seconds, 1));
     [player seekToTime:newTime toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
-}
-
-- (void)setFrameSize:(NSSize)newSize {
-    [super setFrameSize:newSize];
-    if (layer) {
-        layer.frame = self.bounds;
-    }
-}
-
-- (void)dealloc {
-    if (timeObserverToken) {
-        [player removeTimeObserver:timeObserverToken];
-    }
 }
 
 @end
@@ -195,12 +197,12 @@
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
         if (argc < 2) {
-            fprintf(stderr, "Usage: %s <path/to/movie.mp4>\n", argv[0]);
+            fprintf(stderr, "Usage: %s <path/to/media_file>\n", argv[0]);
             return 1;
         }
-
-        NSString *filePath = [NSString stringWithUTF8String:argv[1]];
-        NSURL *url = [NSURL fileURLWithPath:filePath];
+        
+        // 使用 fileURLWithPath 自动处理绝对/相对路径
+        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[1]]];
 
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -214,17 +216,16 @@ int main(int argc, const char * argv[]) {
                         backing:NSBackingStoreBuffered
                           defer:NO];
         
-        [window setTitle:[filePath lastPathComponent]];
+        [window setTitle:[[url lastPathComponent] stringByDeletingPathExtension]];
         [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
-        
-        // 关键：允许窗口接收鼠标移动事件，否则 mouseMoved 不会触发
         [window setAcceptsMouseMovedEvents:YES];
-
-        PlayerView *view = [[PlayerView alloc]
-            initWithFrame:window.contentView.bounds];
         
-        view.videoURL = url;
+        // 视频优化：P3 色域
+        [window setColorSpace:[NSColorSpace displayP3ColorSpace]];
+
+        PlayerView *view = [[PlayerView alloc] initWithFrame:window.contentView.bounds];
         view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [view setVideoURL:url];
 
         window.contentView = view;
         [window makeFirstResponder:view];
