@@ -1,4 +1,3 @@
-cat main.m                                                    
 #import <Cocoa/Cocoa.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
