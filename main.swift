@@ -1,565 +1,640 @@
-import AppKit
+import Cocoa
 import AVFoundation
+import AVKit
+import CoreMedia
+import ImageIO
 import UniformTypeIdentifiers
 
-final class PlayerRenderView: NSView {
-    var onURLDropped: ((URL) -> Void)?
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        registerForDraggedTypes([.fileURL])
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func makeBackingLayer() -> CALayer {
-        AVPlayerLayer()
-    }
-
-    var playerLayer: AVPlayerLayer {
-        layer as! AVPlayerLayer
-    }
-
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        sender.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: nil) ? .copy : []
-    }
-
-    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard
-            let items = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
-            let url = items.first
-        else {
-            return false
-        }
-
-        onURLDropped?(url)
-        return true
-    }
+private enum AppConstants {
+    static let windowSize = NSSize(width: 960, height: 540)
+    static let playlistWidth: CGFloat = 300
+    static let playlistRowHeight: CGFloat = 24
+    static let playlistFontSize: CGFloat = 13
+    static let snapshotCompressionQuality: CGFloat = 0.8
+    static let seekStep: Float64 = 10
+    static let tableColumnIdentifier = NSUserInterfaceItemIdentifier("MainColumn")
+    static let usage = "Usage: avplayer <url_or_file>"
+    static let emptyWindowTitle = "No Media"
+    static let supportedMediaExtensions = Set(["mp4", "mov", "m4v", "avi", "mkv", "ts", "flv", "webm"])
+    static let spaceKeyCode: UInt16 = 49
+    static let leftArrowKeyCode: UInt16 = 123
+    static let rightArrowKeyCode: UInt16 = 124
 }
 
-final class PlayerWindow: NSWindow {
-    var eventHandler: ((NSEvent) -> Bool)?
+private enum KeyboardShortcut: String {
+    case quit = "q"
+    case fullscreen = "f"
+    case playlist = "p"
+    case delete = "d"
+    case snapshot = "s"
+    case info = "i"
+    case next = "n"
+    case previous = "b"
+    case restart = "r"
+}
 
-    override func keyDown(with event: NSEvent) {
-        if eventHandler?(event) == true {
+private final class SegmentResourceLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessionDataDelegate {
+    private let originalURL: URL
+    private lazy var session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration, delegate: self, delegateQueue: .main)
+    }()
+
+    private var pendingRequests: [URLSessionTask: AVAssetResourceLoadingRequest] = [:]
+    private var contentType: String?
+    private var contentLength: Int64 = 0
+
+    init(url: URL) {
+        self.originalURL = url
+        super.init()
+    }
+
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
+    ) -> Bool {
+        if loadingRequest.contentInformationRequest != nil {
+            fillContentInformation(for: loadingRequest)
+            return true
+        }
+
+        if loadingRequest.dataRequest != nil {
+            processDataRequest(for: loadingRequest)
+            return true
+        }
+
+        return false
+    }
+
+    func resourceLoader(_ resourceLoader: AVAssetResourceLoader, didCancel loadingRequest: AVAssetResourceLoadingRequest) {
+        for (task, request) in pendingRequests where request == loadingRequest {
+            task.cancel()
+            pendingRequests.removeValue(forKey: task)
+            break
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        pendingRequests[dataTask]?.dataRequest?.respond(with: data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let loadingRequest = pendingRequests.removeValue(forKey: task) else { return }
+
+        if let error {
+            loadingRequest.finishLoading(with: error)
             return
         }
-        super.keyDown(with: event)
+
+        loadingRequest.finishLoading()
+    }
+
+    private func fillContentInformation(for loadingRequest: AVAssetResourceLoadingRequest) {
+        if contentLength > 0 {
+            completeContentInformation(for: loadingRequest)
+            return
+        }
+
+        var request = URLRequest(url: originalURL)
+        request.httpMethod = "HEAD"
+
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+            guard let self else { return }
+
+            if let error {
+                loadingRequest.finishLoading(with: error)
+                return
+            }
+
+            guard let httpResponse = response as? HTTPURLResponse else {
+                loadingRequest.finishLoading(with: NSError(domain: NSURLErrorDomain, code: NSURLErrorBadServerResponse))
+                return
+            }
+
+            self.contentLength = httpResponse.expectedContentLength
+            self.contentType = httpResponse.mimeType ?? "video/mp4"
+
+            DispatchQueue.main.async {
+                self.completeContentInformation(for: loadingRequest)
+            }
+        }.resume()
+    }
+
+    private func completeContentInformation(for loadingRequest: AVAssetResourceLoadingRequest) {
+        guard let informationRequest = loadingRequest.contentInformationRequest else {
+            loadingRequest.finishLoading()
+            return
+        }
+
+        informationRequest.isByteRangeAccessSupported = true
+        informationRequest.contentType = contentType
+        informationRequest.contentLength = contentLength
+        loadingRequest.finishLoading()
+    }
+
+    private func processDataRequest(for loadingRequest: AVAssetResourceLoadingRequest) {
+        guard let dataRequest = loadingRequest.dataRequest else { return }
+
+        let requestedOffset = dataRequest.currentOffset != 0 ? dataRequest.currentOffset : dataRequest.requestedOffset
+        let requestedLength = Int64(dataRequest.requestedLength)
+        guard requestedLength > 0 else {
+            loadingRequest.finishLoading()
+            return
+        }
+
+        let rangeHeader = "bytes=\(requestedOffset)-\(requestedOffset + requestedLength - 1)"
+
+        var request = URLRequest(url: originalURL)
+        request.setValue(rangeHeader, forHTTPHeaderField: "Range")
+
+        let task = session.dataTask(with: request)
+        pendingRequests[task] = loadingRequest
+        task.resume()
     }
 }
 
-final class PlayerWindowController: NSWindowController, NSWindowDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    private var playlist: [URL]
+    private var currentIndex: Int
+
+    private var window: NSWindow!
+    private var playerView: AVPlayerView!
     private let player = AVPlayer()
-    private let renderView = PlayerRenderView(frame: .zero)
-    private let overlayLabel = NSTextField(labelWithString: "拖入视频或按 ⌘O 打开")
-    private let hintLabel = NSTextField(labelWithString: "Space 播放/暂停  ←/→ 快退快进  ↑/↓ 音量  F 全屏  M 静音")
+    private var playlistScrollView: NSScrollView!
+    private var playlistTableView: NSTableView!
+    private var isProgrammaticSelection = false
+    private var keyboardMonitor: Any?
+    private var resourceLoader: SegmentResourceLoader?
 
-    private let openButton = NSButton(title: "打开", target: nil, action: nil)
-    private let playPauseButton = NSButton(title: "播放", target: nil, action: nil)
-    private let muteButton = NSButton(title: "静音", target: nil, action: nil)
-    private let progressSlider = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
-    private let timeLabel = NSTextField(labelWithString: "00:00 / 00:00")
-
-    private var timeObserver: Any?
-    private var rateObservation: NSKeyValueObservation?
-    private var statusObservation: NSKeyValueObservation?
-    private var keepTimeUpdatesSuspended = false
-
-    init() {
-        let window = PlayerWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 720),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Low Power Player"
-        window.minSize = NSSize(width: 720, height: 420)
-        window.center()
-        window.backgroundColor = .black
-        window.isReleasedWhenClosed = false
-        super.init(window: window)
-        setupPlayer()
-        setupUI()
-        setupObservers()
-        bindActions()
+    init(url: URL) {
+        let resolvedPlaylist = Self.makePlaylist(for: url)
+        self.playlist = resolvedPlaylist.urls
+        self.currentIndex = resolvedPlaylist.currentIndex
+        super.init()
     }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    deinit {
-        if let timeObserver {
-            player.removeTimeObserver(timeObserver)
-        }
-    }
-
-    func show() {
-        showWindow(nil)
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    func openDocument() {
-        guard let window else { return }
-
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.movie, .video]
-
-        panel.beginSheetModal(for: window) { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
-            self?.load(url: url, autoplay: true)
-        }
-    }
-
-    func togglePlayPause() {
-        switch player.timeControlStatus {
-        case .paused:
-            player.play()
-        default:
-            player.pause()
-        }
-    }
-
-    func seek(by seconds: Double) {
-        guard let item = player.currentItem else { return }
-        let duration = item.duration.secondsValue
-        guard duration > 0 else { return }
-
-        let current = player.currentTime().secondsValue
-        let target = min(max(current + seconds, 0), duration)
-        let time = CMTime(seconds: target, preferredTimescale: 600)
-        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
-    }
-
-    func adjustVolume(by delta: Float) {
-        let value = min(max(player.volume + delta, 0), 1)
-        player.volume = value
-        player.isMuted = value == 0
-        updateMuteButton()
-    }
-
-    func toggleMute() {
-        player.isMuted.toggle()
-        updateMuteButton()
-    }
-
-    func stopForPowerSavingIfNeeded() {
-        guard let window else { return }
-        if window.isMiniaturized || !window.occlusionState.contains(.visible) {
-            player.pause()
-        }
-    }
-
-    private func setupPlayer() {
-        player.automaticallyWaitsToMinimizeStalling = true
-        player.volume = 1
-        renderView.playerLayer.player = player
-        renderView.playerLayer.videoGravity = .resizeAspect
-        renderView.playerLayer.needsDisplayOnBoundsChange = false
-        renderView.onURLDropped = { [weak self] url in
-            self?.load(url: url, autoplay: true)
-        }
-    }
-
-    private func setupUI() {
-        guard let contentView = window?.contentView else { return }
-
-        let root = NSView()
-        root.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(root)
-
-        renderView.translatesAutoresizingMaskIntoConstraints = false
-        overlayLabel.translatesAutoresizingMaskIntoConstraints = false
-        hintLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        overlayLabel.font = .systemFont(ofSize: 28, weight: .semibold)
-        overlayLabel.textColor = NSColor.white.withAlphaComponent(0.92)
-        overlayLabel.alignment = .center
-        overlayLabel.lineBreakMode = .byWordWrapping
-        overlayLabel.backgroundColor = .clear
-
-        hintLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        hintLabel.textColor = NSColor.white.withAlphaComponent(0.72)
-        hintLabel.alignment = .center
-        hintLabel.backgroundColor = .clear
-
-        openButton.bezelStyle = .rounded
-        playPauseButton.bezelStyle = .rounded
-        muteButton.bezelStyle = .rounded
-        timeLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        timeLabel.textColor = .secondaryLabelColor
-
-        progressSlider.isContinuous = false
-        progressSlider.controlSize = .small
-
-        let controls = NSStackView(views: [openButton, playPauseButton, progressSlider, timeLabel, muteButton])
-        controls.translatesAutoresizingMaskIntoConstraints = false
-        controls.orientation = .horizontal
-        controls.spacing = 10
-        controls.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
-        controls.alignment = .centerY
-        controls.wantsLayer = true
-        controls.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
-        controls.layer?.cornerRadius = 12
-
-        root.addSubview(renderView)
-        root.addSubview(controls)
-        renderView.addSubview(overlayLabel)
-        renderView.addSubview(hintLabel)
-
-        NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            root.topAnchor.constraint(equalTo: contentView.topAnchor),
-            root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-
-            renderView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            renderView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            renderView.topAnchor.constraint(equalTo: root.topAnchor),
-            renderView.bottomAnchor.constraint(equalTo: controls.topAnchor, constant: -10),
-
-            controls.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-            controls.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
-            controls.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
-            controls.heightAnchor.constraint(equalToConstant: 52),
-
-            progressSlider.widthAnchor.constraint(greaterThanOrEqualToConstant: 240),
-            timeLabel.widthAnchor.constraint(equalToConstant: 108),
-            muteButton.widthAnchor.constraint(equalToConstant: 68),
-            playPauseButton.widthAnchor.constraint(equalToConstant: 68),
-            openButton.widthAnchor.constraint(equalToConstant: 68),
-
-            overlayLabel.centerXAnchor.constraint(equalTo: renderView.centerXAnchor),
-            overlayLabel.centerYAnchor.constraint(equalTo: renderView.centerYAnchor, constant: -12),
-            overlayLabel.leadingAnchor.constraint(greaterThanOrEqualTo: renderView.leadingAnchor, constant: 20),
-            overlayLabel.trailingAnchor.constraint(lessThanOrEqualTo: renderView.trailingAnchor, constant: -20),
-
-            hintLabel.centerXAnchor.constraint(equalTo: renderView.centerXAnchor),
-            hintLabel.topAnchor.constraint(equalTo: overlayLabel.bottomAnchor, constant: 10),
-            hintLabel.leadingAnchor.constraint(greaterThanOrEqualTo: renderView.leadingAnchor, constant: 20),
-            hintLabel.trailingAnchor.constraint(lessThanOrEqualTo: renderView.trailingAnchor, constant: -20)
-        ])
-
-        renderView.wantsLayer = true
-        renderView.layer?.backgroundColor = NSColor.black.cgColor
-    }
-
-    private func bindActions() {
-        openButton.target = self
-        openButton.action = #selector(openDocumentAction)
-
-        playPauseButton.target = self
-        playPauseButton.action = #selector(togglePlayPauseAction)
-
-        muteButton.target = self
-        muteButton.action = #selector(toggleMuteAction)
-
-        progressSlider.target = self
-        progressSlider.action = #selector(sliderChanged(_:))
-
-        (window as? PlayerWindow)?.eventHandler = { [weak self] event in
-            self?.handleKey(event) ?? false
-        }
-    }
-
-    private func setupObservers() {
-        rateObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] _, _ in
-            DispatchQueue.main.async {
-                self?.updatePlayPauseButton()
-            }
-        }
-
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(windowDidChangeOcclusionStateNotification(_:)),
-            name: NSWindow.didChangeOcclusionStateNotification,
-            object: window
-        )
-
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(windowDidMiniaturizeNotification(_:)),
-            name: NSWindow.didMiniaturizeNotification,
-            object: window
-        )
-
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(applicationDidHide(_:)),
-            name: NSApplication.didHideNotification,
-            object: NSApp
-        )
-
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self,
-            selector: #selector(systemWillSleep(_:)),
-            name: NSWorkspace.willSleepNotification,
-            object: nil
-        )
-
-        let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
-        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] _ in
-            self?.refreshTimeline()
-        }
-    }
-
-    private func observeCurrentItem(_ item: AVPlayerItem?) {
-        statusObservation = item?.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                switch item.status {
-                case .readyToPlay:
-                    self.overlayLabel.isHidden = true
-                    self.hintLabel.isHidden = true
-                    self.refreshTimeline()
-                case .failed:
-                    self.overlayLabel.stringValue = item.error?.localizedDescription ?? "无法打开这个视频"
-                    self.overlayLabel.isHidden = false
-                    self.hintLabel.isHidden = false
-                    self.playPauseButton.title = "播放"
-                default:
-                    break
-                }
-            }
-        }
-    }
-
-    private func load(url: URL, autoplay: Bool) {
-        let asset = AVURLAsset(
-            url: url,
-            options: [AVURLAssetPreferPreciseDurationAndTimingKey: false]
-        )
-
-        let item = AVPlayerItem(asset: asset)
-        item.preferredForwardBufferDuration = 1
-        item.canUseNetworkResourcesForLiveStreamingWhilePaused = false
-        item.audioTimePitchAlgorithm = .varispeed
-
-        player.pause()
-        player.replaceCurrentItem(with: item)
-        observeCurrentItem(item)
-
-        window?.title = url.lastPathComponent
-        window?.representedURL = url
-        progressSlider.doubleValue = 0
-        timeLabel.stringValue = "00:00 / 00:00"
-        overlayLabel.stringValue = "正在载入…"
-        overlayLabel.isHidden = false
-        hintLabel.isHidden = false
-
-        if autoplay {
-            player.play()
-        }
-    }
-
-    private func refreshTimeline() {
-        guard !keepTimeUpdatesSuspended else { return }
-
-        let current = player.currentTime().secondsValue
-        let duration = player.currentItem?.duration.secondsValue ?? 0
-
-        if duration > 0 {
-            progressSlider.doubleValue = min(max(current / duration, 0), 1)
-        } else {
-            progressSlider.doubleValue = 0
-        }
-
-        timeLabel.stringValue = "\(format(seconds: current)) / \(format(seconds: duration))"
-    }
-
-    private func updatePlayPauseButton() {
-        let isPlaying = player.timeControlStatus != .paused
-        playPauseButton.title = isPlaying ? "暂停" : "播放"
-    }
-
-    private func updateMuteButton() {
-        muteButton.title = player.isMuted || player.volume <= 0.001 ? "取消静音" : "静音"
-    }
-
-    private func format(seconds: Double) -> String {
-        guard seconds.isFinite, !seconds.isNaN, seconds >= 0 else {
-            return "00:00"
-        }
-
-        let total = Int(seconds.rounded(.down))
-        let hours = total / 3600
-        let minutes = (total % 3600) / 60
-        let secs = total % 60
-
-        if hours > 0 {
-            return String(format: "%d:%02d:%02d", hours, minutes, secs)
-        }
-
-        return String(format: "%02d:%02d", minutes, secs)
-    }
-
-    private func handleKey(_ event: NSEvent) -> Bool {
-        switch event.keyCode {
-        case 49:
-            togglePlayPause()
-            return true
-        case 123:
-            seek(by: -5)
-            return true
-        case 124:
-            seek(by: 5)
-            return true
-        case 125:
-            adjustVolume(by: -0.05)
-            return true
-        case 126:
-            adjustVolume(by: 0.05)
-            return true
-        case 3:
-            window?.toggleFullScreen(nil)
-            return true
-        case 46:
-            toggleMute()
-            return true
-        default:
-            return false
-        }
-    }
-
-    @objc private func openDocumentAction() {
-        openDocument()
-    }
-
-    @objc private func togglePlayPauseAction() {
-        togglePlayPause()
-    }
-
-    @objc private func toggleMuteAction() {
-        toggleMute()
-    }
-
-    @objc private func sliderChanged(_ sender: NSSlider) {
-        guard let item = player.currentItem else { return }
-        let duration = item.duration.secondsValue
-        guard duration > 0 else { return }
-
-        keepTimeUpdatesSuspended = true
-        let target = duration * sender.doubleValue
-        let time = CMTime(seconds: target, preferredTimescale: 600)
-        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.keepTimeUpdatesSuspended = false
-                self?.refreshTimeline()
-            }
-        }
-    }
-
-    @objc private func windowDidChangeOcclusionStateNotification(_ notification: Notification) {
-        stopForPowerSavingIfNeeded()
-    }
-
-    @objc private func windowDidMiniaturizeNotification(_ notification: Notification) {
-        player.pause()
-    }
-
-    @objc private func systemWillSleep(_ notification: Notification) {
-        player.pause()
-    }
-
-    @objc private func applicationDidHide(_ notification: Notification) {
-        player.pause()
-    }
-}
-
-private extension CMTime {
-    var secondsValue: Double {
-        let value = CMTimeGetSeconds(self)
-        return value.isFinite && !value.isNaN ? value : 0
-    }
-}
-
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var controller: PlayerWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        controller = PlayerWindowController()
-        controller?.show()
+        configureWindow()
+        configurePlayerView()
+        configurePlaylistUI()
+
+        playerView.player = player
+        playVideo(at: currentIndex)
+
+        window.makeKeyAndOrderFront(nil)
+        window.toggleFullScreen(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        installKeyboardMonitor()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let keyboardMonitor {
+            NSEvent.removeMonitor(keyboardMonitor)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
 
-    @objc func openDocument(_ sender: Any?) {
-        controller?.openDocument()
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        playlist.count
     }
 
-    @objc func togglePlayback(_ sender: Any?) {
-        controller?.togglePlayPause()
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let textField = NSTextField(labelWithString: playlist[row].lastPathComponent)
+        textField.textColor = row == currentIndex ? .systemYellow : .white
+        textField.font = row == currentIndex
+            ? .boldSystemFont(ofSize: AppConstants.playlistFontSize)
+            : .systemFont(ofSize: AppConstants.playlistFontSize)
+        return textField
     }
 
-    @objc func stepForward(_ sender: Any?) {
-        controller?.seek(by: 5)
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        AppConstants.playlistRowHeight
     }
 
-    @objc func stepBackward(_ sender: Any?) {
-        controller?.seek(by: -5)
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard !isProgrammaticSelection else { return }
+
+        let selectedRow = playlistTableView.selectedRow
+        guard selectedRow >= 0, selectedRow < playlist.count, selectedRow != currentIndex else { return }
+
+        playVideo(at: selectedRow)
     }
 
-    @objc func toggleMute(_ sender: Any?) {
-        controller?.toggleMute()
+    private func configureWindow() {
+        let frame = NSRect(origin: .zero, size: AppConstants.windowSize)
+        window = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.backgroundColor = .black
+        window.collectionBehavior = .fullScreenPrimary
+        window.center()
+        window.delegate = self
+    }
+
+    private func configurePlayerView() {
+        guard let contentView = window.contentView else { return }
+
+        playerView = AVPlayerView(frame: contentView.bounds)
+        playerView.autoresizingMask = [.width, .height]
+        playerView.controlsStyle = .none
+        contentView.addSubview(playerView)
+    }
+
+    private func configurePlaylistUI() {
+        guard let contentView = window.contentView else { return }
+
+        playlistScrollView = NSScrollView()
+        playlistScrollView.translatesAutoresizingMaskIntoConstraints = false
+        playlistScrollView.wantsLayer = true
+        playlistScrollView.drawsBackground = true
+        playlistScrollView.backgroundColor = NSColor(white: 0.1, alpha: 0.9)
+        playlistScrollView.hasVerticalScroller = true
+        playlistScrollView.isHidden = true
+        contentView.addSubview(playlistScrollView, positioned: .above, relativeTo: nil)
+
+        NSLayoutConstraint.activate([
+            playlistScrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            playlistScrollView.topAnchor.constraint(equalTo: contentView.topAnchor),
+            playlistScrollView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            playlistScrollView.widthAnchor.constraint(equalToConstant: AppConstants.playlistWidth)
+        ])
+
+        playlistTableView = NSTableView()
+        let column = NSTableColumn(identifier: AppConstants.tableColumnIdentifier)
+        column.width = AppConstants.playlistWidth - 20
+        playlistTableView.addTableColumn(column)
+        playlistTableView.delegate = self
+        playlistTableView.dataSource = self
+        playlistTableView.headerView = nil
+        playlistTableView.backgroundColor = .clear
+        playlistTableView.appearance = NSAppearance(named: .darkAqua)
+        playlistTableView.style = .fullWidth
+
+        playlistScrollView.documentView = playlistTableView
+    }
+
+    private func playVideo(at index: Int) {
+        guard !playlist.isEmpty else {
+            player.replaceCurrentItem(with: nil)
+            window.title = AppConstants.emptyWindowTitle
+            return
+        }
+
+        currentIndex = normalizedPlaylistIndex(for: index)
+        let url = playlist[currentIndex]
+        window.title = "[\(currentIndex + 1)/\(playlist.count)] \(url.lastPathComponent)"
+
+        let playbackConfiguration = makePlaybackConfiguration(for: url)
+        resourceLoader = playbackConfiguration.resourceLoader
+
+        let asset = AVURLAsset(url: playbackConfiguration.assetURL)
+        if let resourceLoader {
+            asset.resourceLoader.setDelegate(resourceLoader, queue: .main)
+        }
+
+        let item = AVPlayerItem(asset: asset)
+        player.replaceCurrentItem(with: item)
+        player.play()
+        syncPlaylistSelection()
+    }
+
+    private func syncPlaylistSelection() {
+        guard playlistTableView != nil, !playlist.isEmpty else { return }
+
+        isProgrammaticSelection = true
+        playlistTableView.selectRowIndexes(IndexSet(integer: currentIndex), byExtendingSelection: false)
+        playlistTableView.scrollRowToVisible(currentIndex)
+        playlistTableView.reloadData()
+        isProgrammaticSelection = false
+    }
+
+    private func deleteCurrentVideoDirectly() {
+        guard !playlist.isEmpty else { return }
+
+        let urlToDelete = playlist[currentIndex]
+        guard urlToDelete.isFileURL else {
+            showAlert(title: "Delete Failed", message: "Only local files can be deleted.")
+            return
+        }
+        player.pause()
+
+        do {
+            try FileManager.default.removeItem(at: urlToDelete)
+            NSSound.beep()
+            playlist.remove(at: currentIndex)
+
+            if playlist.isEmpty {
+                player.replaceCurrentItem(with: nil)
+                window.title = AppConstants.emptyWindowTitle
+                playlistTableView.reloadData()
+                return
+            }
+
+            currentIndex = min(currentIndex, playlist.count - 1)
+            playVideo(at: currentIndex)
+        } catch {
+            showAlert(title: "Delete Failed", message: error.localizedDescription)
+        }
+    }
+
+    private func installKeyboardMonitor() {
+        keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+
+            if handleCharacterShortcut(for: event) {
+                return nil
+            }
+
+            switch event.keyCode {
+            case AppConstants.spaceKeyCode:
+                togglePlayback()
+                return nil
+            case AppConstants.leftArrowKeyCode:
+                seek(by: -AppConstants.seekStep)
+                return nil
+            case AppConstants.rightArrowKeyCode:
+                seek(by: AppConstants.seekStep)
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    private func handleCharacterShortcut(for event: NSEvent) -> Bool {
+        guard let value = event.charactersIgnoringModifiers?.lowercased(),
+              let shortcut = KeyboardShortcut(rawValue: value) else {
+            return false
+        }
+
+        switch shortcut {
+        case .quit:
+            NSApp.terminate(nil)
+        case .fullscreen:
+            window.toggleFullScreen(nil)
+        case .playlist:
+            playlistScrollView.isHidden.toggle()
+            if !playlistScrollView.isHidden {
+                syncPlaylistSelection()
+            }
+        case .delete:
+            deleteCurrentVideoDirectly()
+        case .snapshot:
+            saveSnapshot()
+        case .info:
+            showMediaInfo()
+        case .next:
+            playVideo(at: currentIndex + 1)
+        case .previous:
+            playVideo(at: currentIndex - 1)
+        case .restart:
+            player.seek(to: .zero)
+            player.play()
+        }
+
+        return true
+    }
+
+    private func togglePlayback() {
+        if player.rate == 0 {
+            player.play()
+        } else {
+            player.pause()
+        }
+    }
+
+    private func seek(by seconds: Float64) {
+        let currentTime = player.currentTime()
+        let targetTime = CMTimeAdd(currentTime, CMTime(seconds: seconds, preferredTimescale: 1))
+        player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    private func showMediaInfo() {
+        guard let currentItem = player.currentItem, !playlist.isEmpty else { return }
+
+        let asset = currentItem.asset
+        let fileName = playlist[currentIndex].lastPathComponent
+
+        Task {
+            do {
+                let info = try await Self.makeMediaInfo(for: asset, fileName: fileName)
+                await MainActor.run {
+                    self.showAlert(title: "Media Information", message: info)
+                }
+            } catch {
+                await MainActor.run {
+                    self.showAlert(title: "Error", message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func saveSnapshot() {
+        guard let asset = player.currentItem?.asset else { return }
+
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+
+        let currentTime = player.currentTime()
+        generator.generateCGImagesAsynchronously(forTimes: [NSValue(time: currentTime)]) { _, image, _, result, error in
+            guard result == .succeeded, let image else {
+                if let error {
+                    DispatchQueue.main.async {
+                        self.showAlert(title: "Snapshot Failed", message: error.localizedDescription)
+                    }
+                }
+                return
+            }
+
+            let data = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(
+                data as CFMutableData,
+                UTType.heic.identifier as CFString,
+                1,
+                nil
+            ) else {
+                return
+            }
+
+            CGImageDestinationAddImage(
+                destination,
+                image,
+                [kCGImageDestinationLossyCompressionQuality as String: AppConstants.snapshotCompressionQuality] as CFDictionary
+            )
+
+            guard CGImageDestinationFinalize(destination) else { return }
+
+            let outputURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("snapshot_\(Int(Date().timeIntervalSince1970)).heic")
+
+            do {
+                try data.write(to: outputURL)
+                DispatchQueue.main.async {
+                    NSSound.beep()
+                    print("Saved: \(outputURL.path)")
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.showAlert(title: "Snapshot Failed", message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func showAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.runModal()
+    }
+
+    private func normalizedPlaylistIndex(for index: Int) -> Int {
+        guard !playlist.isEmpty else { return 0 }
+        if index < 0 { return playlist.count - 1 }
+        if index >= playlist.count { return 0 }
+        return index
+    }
+
+    private func makePlaybackConfiguration(for url: URL) -> (assetURL: URL, resourceLoader: SegmentResourceLoader?) {
+        guard let scheme = url.scheme?.lowercased(), scheme.hasPrefix("http") else {
+            return (url, nil)
+        }
+
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.scheme = "streaming"
+        let assetURL = components?.url ?? url
+        return (assetURL, SegmentResourceLoader(url: url))
+    }
+
+    private static func makePlaylist(for initialURL: URL) -> (urls: [URL], currentIndex: Int) {
+        guard initialURL.isFileURL else {
+            return ([initialURL], 0)
+        }
+
+        let resolvedTargetPath = initialURL.resolvingSymlinksInPath().path
+        let directoryURL = initialURL.deletingLastPathComponent()
+        let fileManager = FileManager.default
+
+        do {
+            let fileURLs = try fileManager.contentsOfDirectory(
+                at: directoryURL,
+                includingPropertiesForKeys: [.contentTypeKey],
+                options: .skipsHiddenFiles
+            )
+
+            let videoFiles = fileURLs
+                .filter(Self.isSupportedMediaFile)
+                .sorted {
+                    $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+                }
+
+            let currentIndex = videoFiles.firstIndex(where: {
+                $0.resolvingSymlinksInPath().path == resolvedTargetPath
+            }) ?? 0
+
+            return (videoFiles.isEmpty ? [initialURL] : videoFiles, currentIndex)
+        } catch {
+            return ([initialURL], 0)
+        }
+    }
+
+    private static func isSupportedMediaFile(_ url: URL) -> Bool {
+        if AppConstants.supportedMediaExtensions.contains(url.pathExtension.lowercased()) {
+            return true
+        }
+
+        guard let resourceValues = try? url.resourceValues(forKeys: [.contentTypeKey]),
+              let contentType = resourceValues.contentType else {
+            return false
+        }
+
+        return AVURLAsset.audiovisualTypes().contains {
+            guard let supportedType = UTType($0.rawValue) else { return false }
+            return contentType.conforms(to: supportedType)
+        }
+    }
+
+    private static func makeMediaInfo(for asset: AVAsset, fileName: String) async throws -> String {
+        let duration = try await asset.load(.duration)
+        let tracks = try await asset.load(.tracks)
+        var lines = [
+            "File: \(fileName)",
+            "Duration: \(String(format: "%.2f", CMTimeGetSeconds(duration)))s"
+        ]
+
+        for track in tracks {
+            if track.mediaType == .video {
+                let size = try await track.load(.naturalSize)
+                let fps = try await track.load(.nominalFrameRate)
+                let formatDescriptions = try await track.load(.formatDescriptions)
+                lines.append(contentsOf: [
+                    "",
+                    "[Video Track]",
+                    "Res: \(Int(size.width))x\(Int(size.height))",
+                    "FPS: \(fps)"
+                ])
+
+                if let description = formatDescriptions.first {
+                    let codec = CMFormatDescriptionGetMediaSubType(description)
+                    lines.append("Codec: \(fourCCString(codec))")
+                }
+            } else if track.mediaType == .audio {
+                let formatDescriptions = try await track.load(.formatDescriptions)
+                lines.append(contentsOf: ["", "[Audio Track]"])
+
+                if let description = formatDescriptions.first,
+                   let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(description) {
+                    lines.append("Sample Rate: \(streamDescription.pointee.mSampleRate) Hz")
+                    lines.append("Format: \(fourCCString(streamDescription.pointee.mFormatID))")
+                }
+            }
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    private static func fourCCString(_ code: FourCharCode) -> String {
+        let value = Int(code)
+        let string = [
+            UnicodeScalar((value >> 24) & 0xFF),
+            UnicodeScalar((value >> 16) & 0xFF),
+            UnicodeScalar((value >> 8) & 0xFF),
+            UnicodeScalar(value & 0xFF)
+        ]
+        .compactMap { $0 }
+        .map(String.init)
+        .joined()
+        .trimmingCharacters(in: .whitespaces)
+
+        return string.isEmpty ? "Unknown" : string
     }
 }
 
-func makeMenu(delegate: AppDelegate) {
-    let mainMenu = NSMenu()
+private func makeInputURL(from input: String) -> URL? {
+    if input.hasPrefix("http://") || input.hasPrefix("https://") {
+        return URL(string: input)
+    }
 
-    let appItem = NSMenuItem()
-    let appMenu = NSMenu()
-    appMenu.addItem(withTitle: "关于播放器", action: nil, keyEquivalent: "")
-    appMenu.addItem(NSMenuItem.separator())
-    appMenu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-    appItem.submenu = appMenu
-    mainMenu.addItem(appItem)
+    return URL(fileURLWithPath: input)
+}
 
-    let fileItem = NSMenuItem()
-    let fileMenu = NSMenu(title: "文件")
-    let openItem = NSMenuItem(title: "打开…", action: #selector(AppDelegate.openDocument(_:)), keyEquivalent: "o")
-    openItem.target = delegate
-    fileMenu.addItem(openItem)
-    fileItem.submenu = fileMenu
-    mainMenu.addItem(fileItem)
+let arguments = CommandLine.arguments
 
-    let playbackItem = NSMenuItem()
-    let playbackMenu = NSMenu(title: "播放")
-
-    let toggleItem = NSMenuItem(title: "播放/暂停", action: #selector(AppDelegate.togglePlayback(_:)), keyEquivalent: " ")
-    toggleItem.target = delegate
-    playbackMenu.addItem(toggleItem)
-
-    let backItem = NSMenuItem(title: "快退 5 秒", action: #selector(AppDelegate.stepBackward(_:)), keyEquivalent: "[")
-    backItem.target = delegate
-    playbackMenu.addItem(backItem)
-
-    let forwardItem = NSMenuItem(title: "快进 5 秒", action: #selector(AppDelegate.stepForward(_:)), keyEquivalent: "]")
-    forwardItem.target = delegate
-    playbackMenu.addItem(forwardItem)
-
-    let muteItem = NSMenuItem(title: "静音/取消静音", action: #selector(AppDelegate.toggleMute(_:)), keyEquivalent: "m")
-    muteItem.target = delegate
-    playbackMenu.addItem(muteItem)
-
-    playbackItem.submenu = playbackMenu
-    mainMenu.addItem(playbackItem)
-
-    NSApp.mainMenu = mainMenu
+guard arguments.count >= 2, let inputURL = makeInputURL(from: arguments[1]) else {
+    print(AppConstants.usage)
+    exit(1)
 }
 
 let app = NSApplication.shared
-let delegate = AppDelegate()
 app.setActivationPolicy(.regular)
-app.delegate = delegate
-makeMenu(delegate: delegate)
+private let appDelegate = AppDelegate(url: inputURL)
+app.delegate = appDelegate
 app.run()
