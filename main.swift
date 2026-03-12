@@ -41,52 +41,70 @@ private struct AppConfiguration {
 }
 
 private struct Playlist {
+    private static let commonExtensions = Set(["mp4", "mov", "m4v", "avi", "mkv", "ts", "flv", "webm"])
+    private static let supportedTypes: [UTType] = AVURLAsset.audiovisualTypes().compactMap { UTType($0.rawValue) }
+
     private(set) var items: [URL]
     private(set) var currentIndex: Int
 
     init(seedURL: URL) {
-        if seedURL.isFileURL {
-            let resolvedSeedPath = seedURL.resolvingSymlinksInPath().path
-            let directoryURL = seedURL.deletingLastPathComponent()
-            let fileManager = FileManager.default
-            let commonExtensions = Set(["mp4", "mov", "m4v", "avi", "mkv", "ts", "flv", "webm"])
-            let supportedTypes = AVURLAsset.audiovisualTypes().compactMap { UTType($0.rawValue) }
-
-            do {
-                let directoryItems = try fileManager.contentsOfDirectory(
-                    at: directoryURL,
-                    includingPropertiesForKeys: [.isRegularFileKey, .contentTypeKey],
-                    options: [.skipsHiddenFiles]
-                )
-
-                let playableItems = directoryItems.filter { fileURL in
-                    guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .contentTypeKey]), values.isRegularFile == true else {
-                        return false
-                    }
-
-                    if commonExtensions.contains(fileURL.pathExtension.lowercased()) {
-                        return true
-                    }
-
-                    guard let contentType = values.contentType else {
-                        return false
-                    }
-
-                    return supportedTypes.contains(where: { contentType.conforms(to: $0) })
-                }
-                .sorted { lhs, rhs in
-                    lhs.lastPathComponent.localizedStandardCompare(rhs.lastPathComponent) == .orderedAscending
-                }
-
-                items = playableItems.isEmpty ? [seedURL] : playableItems
-                currentIndex = items.firstIndex(where: { $0.resolvingSymlinksInPath().path == resolvedSeedPath }) ?? 0
-                return
-            } catch {
-            }
-        }
-
         items = [seedURL]
         currentIndex = 0
+    }
+
+    static func buildItems(for seedURL: URL) -> [URL] {
+        guard seedURL.isFileURL else {
+            return [seedURL]
+        }
+
+        let directoryURL = seedURL.deletingLastPathComponent()
+        let fileManager = FileManager.default
+
+        do {
+            let directoryItems = try fileManager.contentsOfDirectory(
+                at: directoryURL,
+                includingPropertiesForKeys: [.isRegularFileKey, .contentTypeKey],
+                options: [.skipsHiddenFiles]
+            )
+
+            let playableItems = directoryItems.filter { fileURL in
+                guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .contentTypeKey]), values.isRegularFile == true else {
+                    return false
+                }
+
+                if commonExtensions.contains(fileURL.pathExtension.lowercased()) {
+                    return true
+                }
+
+                guard let contentType = values.contentType else {
+                    return false
+                }
+
+                return supportedTypes.contains(where: { contentType.conforms(to: $0) })
+            }
+            .sorted { lhs, rhs in
+                lhs.lastPathComponent.localizedStandardCompare(rhs.lastPathComponent) == .orderedAscending
+            }
+
+            return playableItems.isEmpty ? [seedURL] : playableItems
+        } catch {
+            return [seedURL]
+        }
+    }
+
+    mutating func replaceItems(_ newItems: [URL], preferredURL: URL?) {
+        items = newItems
+        guard !items.isEmpty else {
+            currentIndex = 0
+            return
+        }
+
+        if let preferredURL {
+            let resolvedPreferredPath = preferredURL.resolvingSymlinksInPath().path
+            currentIndex = items.firstIndex(where: { $0.resolvingSymlinksInPath().path == resolvedPreferredPath }) ?? 0
+        } else {
+            currentIndex = 0
+        }
     }
 
     var isEmpty: Bool {
@@ -139,11 +157,19 @@ private final class RemoteAssetLoader: NSObject, AVAssetResourceLoaderDelegate, 
     }
 
     private let originalURL: URL
+    private let loaderQueue = DispatchQueue(label: "RemoteAssetLoader.queue")
+    private lazy var sessionQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "RemoteAssetLoader.sessionQueue"
+        queue.maxConcurrentOperationCount = 1
+        queue.underlyingQueue = loaderQueue
+        return queue
+    }()
     private lazy var session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.urlCache = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        return URLSession(configuration: configuration, delegate: self, delegateQueue: .main)
+        return URLSession(configuration: configuration, delegate: self, delegateQueue: sessionQueue)
     }()
 
     private var metadata: ContentMetadata?
@@ -154,6 +180,10 @@ private final class RemoteAssetLoader: NSObject, AVAssetResourceLoaderDelegate, 
     init(originalURL: URL) {
         self.originalURL = originalURL
         super.init()
+    }
+
+    var delegateQueue: DispatchQueue {
+        loaderQueue
     }
 
     func makeStreamingURL() -> URL {
@@ -269,16 +299,30 @@ private final class RemoteAssetLoader: NSObject, AVAssetResourceLoaderDelegate, 
             return
         }
 
-        guard dataRequest.requestedLength > 0 else {
+        let requestedLength = dataRequest.requestedLength
+        let requestsToEnd = dataRequest.requestsAllDataToEndOfResource
+
+        guard requestedLength > 0 || requestsToEnd else {
             loadingRequest.finishLoading()
             return
         }
 
         let startOffset = dataRequest.currentOffset > 0 ? dataRequest.currentOffset : dataRequest.requestedOffset
-        let endOffset = startOffset + Int64(dataRequest.requestedLength) - 1
 
         var request = URLRequest(url: originalURL)
-        request.setValue("bytes=\(startOffset)-\(endOffset)", forHTTPHeaderField: "Range")
+        if requestsToEnd {
+            request.setValue("bytes=\(startOffset)-", forHTTPHeaderField: "Range")
+        } else {
+            var endOffset = startOffset + Int64(requestedLength) - 1
+            if let metadata, metadata.contentLength > 0 {
+                endOffset = min(endOffset, metadata.contentLength - 1)
+            }
+            guard endOffset >= startOffset else {
+                loadingRequest.finishLoading()
+                return
+            }
+            request.setValue("bytes=\(startOffset)-\(endOffset)", forHTTPHeaderField: "Range")
+        }
 
         let task = session.dataTask(with: request)
         pendingDataRequests[task.taskIdentifier] = loadingRequest
@@ -430,6 +474,7 @@ private extension CMTime {
 @MainActor
 private final class PlayerApplication: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private let player = AVPlayer()
+    private let seedURL: URL
     private var playlist: Playlist
     private var window: NSWindow?
     private var playerView: AVPlayerView?
@@ -438,8 +483,18 @@ private final class PlayerApplication: NSObject, NSApplicationDelegate, NSWindow
     private var keyMonitor: Any?
     private var isProgrammaticSelection = false
     private var remoteAssetLoader: RemoteAssetLoader?
+    private var lastPlaylistCount = 0
+    private var lastSelectedIndex: Int?
+    private var needsPlaylistReload = true
+
+    private static let snapshotDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd_HHmmss"
+        return formatter
+    }()
 
     init(configuration: AppConfiguration) {
+        seedURL = configuration.inputURL
         playlist = Playlist(seedURL: configuration.inputURL)
         super.init()
     }
@@ -448,6 +503,7 @@ private final class PlayerApplication: NSObject, NSApplicationDelegate, NSWindow
         buildInterface()
         installKeyboardMonitor()
         playVideo(at: playlist.currentIndex)
+        refreshPlaylistIfNeeded()
 
         window?.makeKeyAndOrderFront(nil)
         window?.toggleFullScreen(nil)
@@ -652,11 +708,50 @@ private final class PlayerApplication: NSObject, NSApplicationDelegate, NSWindow
         }
     }
 
+    private func refreshPlaylistIfNeeded() {
+        guard seedURL.isFileURL else {
+            return
+        }
+
+        Task.detached(priority: .utility) { [seedURL] in
+            let items = Playlist.buildItems(for: seedURL)
+            await MainActor.run { [weak self] in
+                guard let self else {
+                    return
+                }
+
+                let previousURL = self.playlist.currentURL
+                self.playlist.replaceItems(items, preferredURL: previousURL)
+                self.needsPlaylistReload = true
+
+                if previousURL == nil, !self.playlist.isEmpty {
+                    self.playVideo(at: self.playlist.currentIndex)
+                    return
+                }
+
+                if let previousURL, let updatedURL = self.playlist.currentURL {
+                    let previousPath = previousURL.resolvingSymlinksInPath().path
+                    let updatedPath = updatedURL.resolvingSymlinksInPath().path
+                    if previousPath != updatedPath {
+                        self.playVideo(at: self.playlist.currentIndex)
+                        return
+                    }
+                }
+
+                self.updateWindowTitle()
+                self.syncPlaylistSelection()
+            }
+        }
+    }
+
     private func playVideo(at requestedIndex: Int) {
         guard let url = playlist.select(index: requestedIndex) else {
             player.replaceCurrentItem(with: nil)
             updateWindowTitle()
             playlistTableView?.reloadData()
+            lastPlaylistCount = playlist.items.count
+            lastSelectedIndex = nil
+            needsPlaylistReload = false
             return
         }
 
@@ -665,7 +760,7 @@ private final class PlayerApplication: NSObject, NSApplicationDelegate, NSWindow
             let loader = RemoteAssetLoader(originalURL: url)
             remoteAssetLoader = loader
             asset = AVURLAsset(url: loader.makeStreamingURL())
-            asset.resourceLoader.setDelegate(loader, queue: .main)
+            asset.resourceLoader.setDelegate(loader, queue: loader.delegateQueue)
         } else {
             remoteAssetLoader = nil
             asset = AVURLAsset(url: url)
@@ -686,9 +781,19 @@ private final class PlayerApplication: NSObject, NSApplicationDelegate, NSWindow
 
         resizePlaylistTable()
         isProgrammaticSelection = true
-        playlistTableView.reloadData()
+        let countChanged = playlist.items.count != lastPlaylistCount
+        if needsPlaylistReload || countChanged || lastSelectedIndex == nil {
+            playlistTableView.reloadData()
+            lastPlaylistCount = playlist.items.count
+            needsPlaylistReload = false
+        } else if let previousIndex = lastSelectedIndex, previousIndex != playlist.currentIndex {
+            let rowIndexes = IndexSet([previousIndex, playlist.currentIndex])
+            let columnIndexes = IndexSet(integer: 0)
+            playlistTableView.reloadData(forRowIndexes: rowIndexes, columnIndexes: columnIndexes)
+        }
         playlistTableView.selectRowIndexes(IndexSet(integer: playlist.currentIndex), byExtendingSelection: false)
         playlistTableView.scrollRowToVisible(playlist.currentIndex)
+        lastSelectedIndex = playlist.currentIndex
         isProgrammaticSelection = false
     }
 
@@ -734,12 +839,16 @@ private final class PlayerApplication: NSObject, NSApplicationDelegate, NSWindow
         do {
             try FileManager.default.removeItem(at: currentURL)
             playlist.removeCurrentItem()
+            needsPlaylistReload = true
             NSSound.beep()
 
             if playlist.isEmpty {
                 player.replaceCurrentItem(with: nil)
                 updateWindowTitle()
                 playlistTableView?.reloadData()
+                lastPlaylistCount = playlist.items.count
+                lastSelectedIndex = nil
+                needsPlaylistReload = false
             } else {
                 playVideo(at: playlist.currentIndex)
             }
@@ -815,9 +924,7 @@ private final class PlayerApplication: NSObject, NSApplicationDelegate, NSWindow
     }
 
     private func makeSnapshotURL() -> URL {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd_HHmmss"
-        let fileName = "snapshot_\(formatter.string(from: Date())).png"
+        let fileName = "snapshot_\(Self.snapshotDateFormatter.string(from: Date())).png"
         return URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(fileName)
     }
 
