@@ -1,947 +1,739 @@
-//swiftc -framework Cocoa -framework AVFoundation -framework CoreMedia -framework UniformTypeIdentifiers -framework AVKit main.swift -o avplayer
+// Build example:
+// swiftc -O -framework Cocoa -framework AVFoundation -framework AVKit -framework UniformTypeIdentifiers main.swift -o localplayer
 
 import AVFoundation
 import AVKit
 import Cocoa
 import CoreMedia
-import ImageIO
+import Foundation
 import UniformTypeIdentifiers
 
-// MARK: - Constants
-
-private enum Constants {
-    enum Window {
-        static let defaultFrame = NSRect(x: 0, y: 0, width: 960, height: 540)
-        static let title = "No Media"
-    }
-
-    enum Playlist {
-        static let panelWidth: CGFloat = 300
-        static let columnWidth: CGFloat = 280
-        static let rowHeight: CGFloat = 24
-        static let fontSize: CGFloat = 13
-        static let background = NSColor(white: 0.1, alpha: 0.9)
-        static let cellID = NSUserInterfaceItemIdentifier("Cell")
-        static let columnID = NSUserInterfaceItemIdentifier("Column")
-    }
-
-    enum Seek {
-        static let interval: Float64 = 10
-        static let timescale: CMTimeScale = 1
-    }
-
-    enum Cursor {
-        static let hideDelay: TimeInterval = 2.5
-    }
-
-    enum Snapshot {
-        static let compressionQuality: CGFloat = 0.8
-    }
+private enum ExitCode: Int32 {
+    case success = 0
+    case usage = 64
+    case unavailable = 69
+    case software = 70
 }
 
-// MARK: - StreamingResourceLoader
-
-/// Intercepts `streaming://` URLs and proxies them as byte-range HTTP requests,
-/// enabling AVFoundation to seek into remote files without downloading everything first.
-final class StreamingResourceLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessionDataDelegate {
-
-    private let remoteURL: URL
-
-    private lazy var session: URLSession = {
-        let config = URLSessionConfiguration.ephemeral
-        config.urlCache = nil
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        return URLSession(configuration: config, delegate: self, delegateQueue: .main)
-    }()
-
-    // Active loading requests keyed by their URLSession task identifier.
-    private var activeTasks: [Int: AVAssetResourceLoadingRequest] = [:]
-
-    // Reverse map: loading request → task (for cancellation).
-    private var requestToTask: [ObjectIdentifier: URLSessionTask] = [:]
-
-    // Content-information state
-    private var contentLength: Int64 = 0
-    private var contentType: String?
-    private var isFetchingMetadata = false
-    private var pendingMetadataRequests: [ObjectIdentifier: AVAssetResourceLoadingRequest] = [:]
-
-    init(remoteURL: URL) {
-        self.remoteURL = remoteURL
-        super.init()
-    }
-
-    // MARK: AVAssetResourceLoaderDelegate
-
-    func resourceLoader(
-        _ resourceLoader: AVAssetResourceLoader,
-        shouldWaitForLoadingOfRequestedResource request: AVAssetResourceLoadingRequest
-    ) -> Bool {
-        if request.contentInformationRequest != nil {
-            handleMetadataRequest(request)
-        }
-        if request.dataRequest != nil {
-            handleDataRequest(request)
-        }
-        return true
-    }
-
-    func resourceLoader(
-        _ resourceLoader: AVAssetResourceLoader,
-        didCancel request: AVAssetResourceLoadingRequest
-    ) {
-        let id = ObjectIdentifier(request)
-        pendingMetadataRequests.removeValue(forKey: id)
-
-        if let task = requestToTask.removeValue(forKey: id) {
-            activeTasks.removeValue(forKey: task.taskIdentifier)
-            task.cancel()
-        }
-    }
-
-    // MARK: Metadata
-
-    private var hasMetadata: Bool { contentLength > 0 }
-
-    private func handleMetadataRequest(_ request: AVAssetResourceLoadingRequest) {
-        if hasMetadata {
-            populateMetadata(into: request)
-            finishMetadataOnlyRequest(request)
-            return
-        }
-
-        pendingMetadataRequests[ObjectIdentifier(request)] = request
-        guard !isFetchingMetadata else { return }
-
-        isFetchingMetadata = true
-        fetchMetadata()
-    }
-
-    private func fetchMetadata() {
-        // Try HEAD first; fall back to a 1-byte GET if the server doesn't support it.
-        runMetadataTask(makeHeadRequest()) { [weak self] response, error in
-            guard let self else { return }
-
-            if self.applyMetadata(from: response) {
-                self.flushMetadataRequests(error: nil)
-            } else {
-                self.runMetadataTask(self.makeRangeRequest(offset: 0, length: 1)) { [weak self] fb, fbErr in
-                    guard let self else { return }
-                    _ = self.applyMetadata(from: fb)
-                    self.flushMetadataRequests(error: fbErr ?? error)
-                }
-            }
-        }
-    }
-
-    private func runMetadataTask(
-        _ request: URLRequest,
-        completion: @escaping (URLResponse?, Error?) -> Void
-    ) {
-        session.dataTask(with: request) { _, response, error in
-            DispatchQueue.main.async { completion(response, error) }
-        }.resume()
-    }
-
-    @discardableResult
-    private func applyMetadata(from response: URLResponse?) -> Bool {
-        guard let http = response as? HTTPURLResponse else { return false }
-        contentLength = extractContentLength(from: http)
-        contentType = extractContentType(from: http)
-        return hasMetadata
-    }
-
-    private func extractContentLength(from response: HTTPURLResponse) -> Int64 {
-        if response.expectedContentLength > 0 {
-            return response.expectedContentLength
-        }
-
-        return response.value(forHTTPHeaderField: "Content-Range")
-            .flatMap { range in
-                range.split(separator: "/").last.flatMap { Int64($0) }
-            } ?? 0
-    }
-
-    private func extractContentType(from response: HTTPURLResponse) -> String {
-        if let mime = response.mimeType, let type = UTType(mimeType: mime) {
-            return type.identifier
-        }
-
-        let ext = remoteURL.pathExtension
-        if !ext.isEmpty, let type = UTType(filenameExtension: ext) {
-            return type.identifier
-        }
-
-        return UTType.mpeg4Movie.identifier
-    }
-
-    private func populateMetadata(into request: AVAssetResourceLoadingRequest) {
-        guard let info = request.contentInformationRequest else { return }
-        info.isByteRangeAccessSupported = true
-        info.contentLength = contentLength
-        info.contentType = contentType
-    }
-
-    private func finishMetadataOnlyRequest(_ request: AVAssetResourceLoadingRequest) {
-        if request.dataRequest == nil {
-            request.finishLoading()
-        }
-    }
-
-    private func flushMetadataRequests(error: Error?) {
-        isFetchingMetadata = false
-        let requests = pendingMetadataRequests.values
-        pendingMetadataRequests.removeAll()
-
-        for request in requests {
-            if hasMetadata {
-                populateMetadata(into: request)
-                finishMetadataOnlyRequest(request)
-            } else {
-                request.finishLoading(with: error)
-            }
-        }
-    }
-
-    // MARK: Data
-
-    private func handleDataRequest(_ request: AVAssetResourceLoadingRequest) {
-        guard let dataRequest = request.dataRequest else { return }
-
-        let offset = dataRequest.currentOffset != 0
-            ? dataRequest.currentOffset
-            : dataRequest.requestedOffset
-
-        let urlRequest = makeRangeRequest(offset: offset, length: dataRequest.requestedLength)
-        let task = session.dataTask(with: urlRequest)
-
-        activeTasks[task.taskIdentifier] = request
-        requestToTask[ObjectIdentifier(request)] = task
-        task.resume()
-    }
-
-    // MARK: URLSessionDataDelegate
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        activeTasks[dataTask.taskIdentifier]?.dataRequest?.respond(with: data)
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard let request = activeTasks.removeValue(forKey: task.taskIdentifier) else { return }
-        requestToTask.removeValue(forKey: ObjectIdentifier(request))
-
-        if let error {
-            request.finishLoading(with: error)
-        } else {
-            request.finishLoading()
-        }
-    }
-
-    // MARK: Helpers
-
-    private func makeHeadRequest() -> URLRequest {
-        var r = URLRequest(url: remoteURL)
-        r.httpMethod = "HEAD"
-        return r
-    }
-
-    private func makeRangeRequest(offset: Int64, length: Int) -> URLRequest {
-        var r = URLRequest(url: remoteURL)
-        let upper = offset + Int64(max(length, 1)) - 1
-        r.setValue("bytes=\(offset)-\(upper)", forHTTPHeaderField: "Range")
-        return r
-    }
+private enum Defaults {
+    static let initialWindowRect = NSRect(x: 0, y: 0, width: 960, height: 540)
+    static let minimumContentSize = NSSize(width: 480, height: 270)
+    static let seekStepSeconds = 10.0
+    static let timeScale: CMTimeScale = 600
+    static let windowStyle: NSWindow.StyleMask = [
+        .titled,
+        .closable,
+        .miniaturizable,
+        .resizable
+    ]
 }
 
-// MARK: - Playlist
-
-struct Playlist {
-    let urls: [URL]
-    let startIndex: Int
-
-    static func build(from url: URL) -> Playlist {
-        guard url.isFileURL else {
-            return Playlist(urls: [url], startIndex: 0)
-        }
-
-        let siblings = (try? Scanner.mediaFiles(near: url)) ?? []
-        guard !siblings.isEmpty else {
-            return Playlist(urls: [url], startIndex: 0)
-        }
-
-        let target = url.resolvingSymlinksInPath().path
-        let index = siblings.firstIndex { $0.resolvingSymlinksInPath().path == target } ?? 0
-        return Playlist(urls: siblings, startIndex: index)
-    }
-
-    private enum Scanner {
-        private static let knownExtensions: Set<String> = [
-            "mp4", "mov", "m4v", "avi", "mkv", "ts", "flv", "webm"
-        ]
-
-        private static let avTypes = AVURLAsset.audiovisualTypes()
-            .compactMap { UTType($0.rawValue) }
-
-        static func mediaFiles(near url: URL) throws -> [URL] {
-            let dir = url.deletingLastPathComponent()
-            let contents = try FileManager.default.contentsOfDirectory(
-                at: dir,
-                includingPropertiesForKeys: [.contentTypeKey],
-                options: .skipsHiddenFiles
-            )
-            return contents
-                .filter(isPlayable)
-                .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-        }
-
-        private static func isPlayable(_ url: URL) -> Bool {
-            if knownExtensions.contains(url.pathExtension.lowercased()) { return true }
-            guard
-                let values = try? url.resourceValues(forKeys: [.contentTypeKey]),
-                let type = values.contentType
-            else { return false }
-            return avTypes.contains { type.conforms(to: $0) }
-        }
-    }
+private enum AppState {
+    static var exitCode: ExitCode = .success
 }
 
-// MARK: - KeyboardShortcut
-
-enum KeyboardShortcut {
-    case quit
-    case toggleFullscreen
-    case togglePlaylist
-    case deleteCurrent
-    case saveSnapshot
-    case showMediaInfo
-    case next
-    case previous
-    case restart
-    case togglePlayback
-    case seekBackward
-    case seekForward
-
-    init?(event: NSEvent) {
-        switch event.charactersIgnoringModifiers?.lowercased() {
-        case "q": self = .quit
-        case "f": self = .toggleFullscreen
-        case "p": self = .togglePlaylist
-        case "d": self = .deleteCurrent
-        case "s": self = .saveSnapshot
-        case "i": self = .showMediaInfo
-        case "n": self = .next
-        case "b": self = .previous
-        case "r": self = .restart
-        default:
-            switch event.keyCode {
-            case 49:  self = .togglePlayback  // Space
-            case 123: self = .seekBackward    // ←
-            case 124: self = .seekForward     // →
-            default:  return nil
-            }
-        }
-    }
-}
-
-// MARK: - PlayerController
-
-/// Owns the AVPlayer, resource loading, and playback logic.
-final class PlayerController {
-    let player = AVPlayer()
-
-    private var urls: [URL] = []
-    private(set) var currentIndex: Int = 0
-    private var resourceLoader: StreamingResourceLoader?
-
-    var onTrackChange: ((Int, URL) -> Void)?
-
-    // MARK: Playlist
-
-    func load(playlist: Playlist) {
-        urls = playlist.urls
-        currentIndex = playlist.startIndex
-        play(at: currentIndex, notify: false)
-    }
-
-    func playNext()     { play(at: currentIndex + 1) }
-    func playPrevious() { play(at: currentIndex - 1) }
-    func restart()      { player.seek(to: .zero); player.play() }
-
-    func play(at index: Int, notify: Bool = true) {
-        guard !urls.isEmpty else { return }
-
-        currentIndex = wrapping(index, in: urls.count)
-        let url = urls[currentIndex]
-
-        resourceLoader = url.isFileURL ? nil : StreamingResourceLoader(remoteURL: url)
-
-        let asset = AVURLAsset(url: streamingURL(for: url))
-        if let loader = resourceLoader {
-            asset.resourceLoader.setDelegate(loader, queue: .main)
-        }
-
-        player.replaceCurrentItem(with: AVPlayerItem(asset: asset))
-        player.play()
-
-        if notify { onTrackChange?(currentIndex, url) }
-    }
-
-    func deleteCurrentFile() throws {
-        guard !urls.isEmpty else { return }
-        let url = urls[currentIndex]
-        guard url.isFileURL else { throw PlayerError.notLocalFile }
-
-        player.pause()
-        try FileManager.default.removeItem(at: url)
-        urls.remove(at: currentIndex)
-
-        if urls.isEmpty {
-            player.replaceCurrentItem(with: nil)
-        } else {
-            play(at: currentIndex)
-        }
-    }
-
-    var currentURL: URL? { urls.indices.contains(currentIndex) ? urls[currentIndex] : nil }
-    var playlistURLs: [URL] { urls }
-    var count: Int { urls.count }
-
-    // MARK: Seek
-
-    func seek(by seconds: Float64) {
-        let newTime = CMTimeAdd(
-            player.currentTime(),
-            CMTime(seconds: seconds, preferredTimescale: Constants.Seek.timescale)
-        )
-        player.seek(to: newTime, toleranceBefore: .zero, toleranceAfter: .zero)
-    }
-
-    // MARK: Snapshot
-
-    func captureSnapshot(completion: @escaping (URL?) -> Void) {
-        guard let asset = player.currentItem?.asset else { completion(nil); return }
-
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-
-        generator.generateCGImagesAsynchronously(forTimes: [NSValue(time: player.currentTime())]) { _, image, _, result, _ in
-            guard result == .succeeded, let image else { completion(nil); return }
-
-            let data = NSMutableData()
-            guard
-                let dest = CGImageDestinationCreateWithData(
-                    data as CFMutableData,
-                    UTType.heic.identifier as CFString, 1, nil
-                )
-            else { completion(nil); return }
-
-            CGImageDestinationAddImage(
-                dest, image,
-                [kCGImageDestinationLossyCompressionQuality as String: Constants.Snapshot.compressionQuality] as CFDictionary
-            )
-            guard CGImageDestinationFinalize(dest) else { completion(nil); return }
-
-            let outputURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent("snapshot_\(Int(Date().timeIntervalSince1970)).heic")
-            try? data.write(to: outputURL)
-
-            DispatchQueue.main.async { completion(outputURL) }
-        }
-    }
-
-    // MARK: Media Info
-
-    func buildMediaInfo() async throws -> String {
-        guard
-            let item = player.currentItem,
-            let url = currentURL
-        else { throw PlayerError.noActiveItem }
-
-        let asset = await item.asset
-        let duration = try await asset.load(.duration)
-        let tracks = try await asset.load(.tracks)
-
-        var lines = [
-            "File: \(url.lastPathComponent)",
-            "Duration: \(String(format: "%.2f", CMTimeGetSeconds(duration)))s"
-        ]
-
-        for track in tracks {
-            switch track.mediaType {
-            case .video: lines.append(try await describeVideo(track))
-            case .audio: lines.append(try await describeAudio(track))
-            default: continue
-            }
-        }
-
-        return lines.joined(separator: "\n")
-    }
-
-    // MARK: Private
-
-    private func describeVideo(_ track: AVAssetTrack) async throws -> String {
-        let size = try await track.load(.naturalSize)
-        let fps  = try await track.load(.nominalFrameRate)
-        let fmts = try await track.load(.formatDescriptions)
-        var lines = ["", "[Video]", "Res: \(Int(size.width))×\(Int(size.height))", "FPS: \(fps)"]
-        if let fmt = fmts.first {
-            lines.append("Codec: \(fourCC(CMFormatDescriptionGetMediaSubType(fmt)))")
-        }
-        return lines.joined(separator: "\n")
-    }
-
-    private func describeAudio(_ track: AVAssetTrack) async throws -> String {
-        let fmts = try await track.load(.formatDescriptions)
-        var lines = ["", "[Audio]"]
-        if let fmt = fmts.first,
-           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt) {
-            lines.append("Sample Rate: \(asbd.pointee.mSampleRate) Hz")
-            lines.append("Format: \(fourCC(asbd.pointee.mFormatID))")
-        }
-        return lines.joined(separator: "\n")
-    }
-
-    private func streamingURL(for url: URL) -> URL {
-        guard
-            ["http", "https"].contains(url.scheme?.lowercased()),
-            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        else { return url }
-
-        components.scheme = "streaming"
-        return components.url ?? url
-    }
-
-    private func wrapping(_ index: Int, in count: Int) -> Int {
-        guard count > 0 else { return 0 }
-        let r = index % count
-        return r >= 0 ? r : r + count
-    }
-
-    private func fourCC(_ code: FourCharCode) -> String {
-        let i = Int(code)
-        let bytes: [Int] = [(i >> 24) & 0xFF, (i >> 16) & 0xFF, (i >> 8) & 0xFF, i & 0xFF]
-        let scalars = bytes.compactMap { UnicodeScalar($0) }
-        let chars = scalars.map { String($0) }.joined()
-        let trimmed = chars.trimmingCharacters(in: CharacterSet.whitespaces)
-        return trimmed.isEmpty ? "Unknown" : trimmed
-    }
-}
-
-enum PlayerError: LocalizedError {
-    case notLocalFile
-    case noActiveItem
+private enum PlayerError: LocalizedError {
+    case missingMediaPath
+    case invalidOption(String)
+    case missingOptionValue(String)
+    case invalidVolume(String)
+    case invalidStartTime(String)
+    case tooManyPaths
+    case unsupportedURL(String)
+    case fileNotFound(String)
+    case directoryNotSupported(String)
+    case unreadableFile(String)
+    case unsupportedFileType(String)
+    case playerFailed(String)
 
     var errorDescription: String? {
         switch self {
-        case .notLocalFile:  return "Only local files can be deleted."
-        case .noActiveItem:  return "No media is currently loaded."
+        case .missingMediaPath:
+            return "Missing local media path."
+        case let .invalidOption(option):
+            return "Unknown option: \(option)"
+        case let .missingOptionValue(option):
+            return "Missing value for option: \(option)"
+        case let .invalidVolume(value):
+            return "Invalid volume '\(value)'. Expected a number between 0 and 1."
+        case let .invalidStartTime(value):
+            return "Invalid start time '\(value)'. Expected a non-negative number of seconds."
+        case .tooManyPaths:
+            return "Only one media file can be played at a time."
+        case let .unsupportedURL(value):
+            return "Only local file paths or file:// URLs are supported: \(value)"
+        case let .fileNotFound(path):
+            return "File does not exist: \(path)"
+        case let .directoryNotSupported(path):
+            return "Directories are not supported: \(path)"
+        case let .unreadableFile(path):
+            return "File is not readable: \(path)"
+        case let .unsupportedFileType(path):
+            return "Unsupported media type: \(path)"
+        case let .playerFailed(message):
+            return "Playback failed: \(message)"
         }
     }
 }
 
-// MARK: - PlaylistPanel
+private struct CLIOptions {
+    let mediaPath: String
+    let autoplay: Bool
+    let loopPlayback: Bool
+    let quitWhenFinished: Bool
+    let muted: Bool
+    let volume: Float
+    let startAtSeconds: Double
 
-/// A self-contained sidebar that shows the current playlist.
-final class PlaylistPanel: NSScrollView, NSTableViewDataSource, NSTableViewDelegate {
-    private let table = NSTableView()
+    static func usage(programName: String) -> String {
+        """
+        Usage:
+          \(programName) [options] <local-media-file>
 
-    var urls: [URL] = [] {
-        didSet { table.reloadData() }
+        Options:
+          --loop                 Restart automatically when playback reaches the end.
+          --no-autoplay          Open the window without starting playback.
+          --quit-when-finished   Exit the app when playback completes.
+          --mute                 Start muted.
+          --volume <0...1>       Initial output volume. Default: 1.0
+          --start-at <seconds>   Seek to a start position before playback begins.
+          -h, --help             Show this help message.
+
+        Notes:
+          - Only local files are supported.
+          - This player is intentionally event-driven for low energy use:
+            no polling timers, no periodic observers, and one-time window sizing.
+        """
+    }
+}
+
+private enum CLIParser {
+    static func parse(arguments: [String]) throws -> CLIOptions? {
+        var autoplay = true
+        var loopPlayback = false
+        var quitWhenFinished = false
+        var muted = false
+        var volume: Float = 1.0
+        var startAtSeconds = 0.0
+        var mediaPath: String?
+        var index = 0
+        var stopParsingOptions = false
+
+        while index < arguments.count {
+            let argument = arguments[index]
+
+            if stopParsingOptions {
+                if mediaPath == nil {
+                    mediaPath = argument
+                } else {
+                    throw PlayerError.tooManyPaths
+                }
+                index += 1
+                continue
+            }
+
+            switch argument {
+            case "-h", "--help":
+                return nil
+            case "--":
+                stopParsingOptions = true
+            case "--loop":
+                loopPlayback = true
+            case "--no-autoplay":
+                autoplay = false
+            case "--quit-when-finished":
+                quitWhenFinished = true
+            case "--mute":
+                muted = true
+            case "--volume":
+                let value = try nextValue(after: &index, in: arguments, option: argument)
+                guard let parsed = Float(value), (0...1).contains(parsed) else {
+                    throw PlayerError.invalidVolume(value)
+                }
+                volume = parsed
+            case "--start-at":
+                let value = try nextValue(after: &index, in: arguments, option: argument)
+                guard let parsed = Double(value), parsed >= 0 else {
+                    throw PlayerError.invalidStartTime(value)
+                }
+                startAtSeconds = parsed
+            default:
+                if argument.hasPrefix("-") {
+                    throw PlayerError.invalidOption(argument)
+                }
+                if mediaPath == nil {
+                    mediaPath = argument
+                } else {
+                    throw PlayerError.tooManyPaths
+                }
+            }
+
+            index += 1
+        }
+
+        guard let mediaPath else {
+            throw PlayerError.missingMediaPath
+        }
+
+        return CLIOptions(
+            mediaPath: mediaPath,
+            autoplay: autoplay,
+            loopPlayback: loopPlayback,
+            quitWhenFinished: quitWhenFinished,
+            muted: muted,
+            volume: volume,
+            startAtSeconds: startAtSeconds
+        )
     }
 
-    var currentIndex: Int = -1 {
-        didSet { table.reloadData() }
+    private static func nextValue(
+        after index: inout Int,
+        in arguments: [String],
+        option: String
+    ) throws -> String {
+        let nextIndex = index + 1
+        guard nextIndex < arguments.count else {
+            throw PlayerError.missingOptionValue(option)
+        }
+        index = nextIndex
+        return arguments[nextIndex]
+    }
+}
+
+private struct MediaLocator {
+    static func resolve(from rawPath: String) throws -> URL {
+        let url: URL
+        if rawPath.contains("://") {
+            guard let parsed = URL(string: rawPath), parsed.isFileURL else {
+                throw PlayerError.unsupportedURL(rawPath)
+            }
+            url = parsed
+        } else {
+            let expandedPath = (rawPath as NSString).expandingTildeInPath
+            if expandedPath.hasPrefix("/") {
+                url = URL(fileURLWithPath: expandedPath)
+            } else {
+                let cwd = FileManager.default.currentDirectoryPath
+                url = URL(fileURLWithPath: cwd).appendingPathComponent(expandedPath)
+            }
+        }
+
+        let standardizedURL = url.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        let path = standardizedURL.path
+
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else {
+            throw PlayerError.fileNotFound(path)
+        }
+        guard !isDirectory.boolValue else {
+            throw PlayerError.directoryNotSupported(path)
+        }
+        guard FileManager.default.isReadableFile(atPath: path) else {
+            throw PlayerError.unreadableFile(path)
+        }
+        guard isLikelySupportedMedia(url: standardizedURL) else {
+            throw PlayerError.unsupportedFileType(path)
+        }
+
+        return standardizedURL
     }
 
-    /// Called when the user clicks a row. Passes the selected index.
-    var onSelection: ((Int) -> Void)?
+    private static func isLikelySupportedMedia(url: URL) -> Bool {
+        let pathExtension = url.pathExtension
+        guard !pathExtension.isEmpty else {
+            return true
+        }
+        guard let type = UTType(filenameExtension: pathExtension) else {
+            return true
+        }
+        return type.conforms(to: .movie) || type.conforms(to: .audio) || type.conforms(to: .mpeg4Movie)
+    }
+}
 
-    private var suppressSelectionCallback = false
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        setup()
+private enum StandardIO {
+    static func writeLine(_ message: String) {
+        write(message + "\n", to: FileHandle.standardOutput)
     }
 
+    static func writeErrorLine(_ message: String) {
+        write(message + "\n", to: FileHandle.standardError)
+    }
+
+    private static func write(_ message: String, to handle: FileHandle) {
+        guard let data = message.data(using: .utf8) else { return }
+        try? handle.write(contentsOf: data)
+    }
+}
+
+private final class PlaybackSession {
+    let player: AVPlayer
+
+    var onPresentationSizeAvailable: ((CGSize) -> Void)?
+    var onPlaybackFailure: ((String) -> Void)?
+    var onPlaybackFinished: (() -> Void)?
+
+    private let options: CLIOptions
+    private let item: AVPlayerItem
+
+    private var itemStatusObservation: NSKeyValueObservation?
+    private var presentationSizeObservation: NSKeyValueObservation?
+    private var itemEndObserver: NSObjectProtocol?
+
+    private var didPreparePlayback = false
+    private var didPublishPresentationSize = false
+
+    init(options: CLIOptions, mediaURL: URL) {
+        self.options = options
+
+        let asset = AVURLAsset(
+            url: mediaURL,
+            options: [AVURLAssetPreferPreciseDurationAndTimingKey: false]
+        )
+
+        let item = AVPlayerItem(asset: asset)
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = false
+        item.preferredForwardBufferDuration = 0
+
+        let player = AVPlayer(playerItem: item)
+        player.actionAtItemEnd = options.loopPlayback ? .none : .pause
+        player.automaticallyWaitsToMinimizeStalling = true
+        player.allowsExternalPlayback = false
+        player.preventsDisplaySleepDuringVideoPlayback = false
+        player.isMuted = options.muted
+        player.volume = options.volume
+
+        self.item = item
+        self.player = player
+
+        beginObserving()
+    }
+
+    deinit {
+        tearDown()
+    }
+
+    func playIfNeeded() {
+        guard options.autoplay else { return }
+        player.play()
+    }
+
+    func togglePlayback() {
+        if player.timeControlStatus == .paused {
+            player.play()
+        } else {
+            player.pause()
+        }
+    }
+
+    func pause() {
+        player.pause()
+    }
+
+    func toggleMute() {
+        player.isMuted.toggle()
+    }
+
+    func seek(by deltaSeconds: Double) {
+        let currentSeconds = player.currentTime().seconds
+        let safeCurrentSeconds = currentSeconds.isFinite ? currentSeconds : 0
+        let targetSeconds = max(0, safeCurrentSeconds + deltaSeconds)
+        let target = CMTime(seconds: targetSeconds, preferredTimescale: Defaults.timeScale)
+
+        player.seek(
+            to: target,
+            toleranceBefore: .positiveInfinity,
+            toleranceAfter: .positiveInfinity
+        )
+    }
+
+    private func beginObserving() {
+        itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            self?.handleItemStatus(item.status)
+        }
+
+        presentationSizeObservation = item.observe(\.presentationSize, options: [.new]) { [weak self] item, _ in
+            self?.handlePresentationSize(item.presentationSize)
+        }
+
+        itemEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleItemEnded()
+        }
+    }
+
+    private func handleItemStatus(_ status: AVPlayerItem.Status) {
+        switch status {
+        case .readyToPlay:
+            preparePlaybackIfNeeded()
+        case .failed:
+            let message = item.error?.localizedDescription ?? "Unknown AVPlayerItem failure."
+            onPlaybackFailure?(message)
+        case .unknown:
+            break
+        @unknown default:
+            break
+        }
+    }
+
+    private func preparePlaybackIfNeeded() {
+        guard !didPreparePlayback else { return }
+        didPreparePlayback = true
+
+        let startTime = options.startAtSeconds
+        guard startTime > 0 else {
+            playIfNeeded()
+            return
+        }
+
+        let target = CMTime(seconds: startTime, preferredTimescale: Defaults.timeScale)
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            self?.playIfNeeded()
+        }
+    }
+
+    private func handlePresentationSize(_ size: CGSize) {
+        guard !didPublishPresentationSize, size.width > 0, size.height > 0 else {
+            return
+        }
+
+        didPublishPresentationSize = true
+        player.preventsDisplaySleepDuringVideoPlayback = true
+        onPresentationSizeAvailable?(size)
+
+        // Window sizing only needs the first stable presentation size.
+        presentationSizeObservation = nil
+    }
+
+    private func handleItemEnded() {
+        if options.loopPlayback {
+            player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                self?.player.play()
+            }
+            return
+        }
+
+        onPlaybackFinished?()
+    }
+
+    private func tearDown() {
+        if let itemEndObserver {
+            NotificationCenter.default.removeObserver(itemEndObserver)
+        }
+        itemEndObserver = nil
+        itemStatusObservation = nil
+        presentationSizeObservation = nil
+        player.pause()
+    }
+}
+
+private final class PlayerWindowController: NSWindowController, NSWindowDelegate {
+    private let playerView = AVPlayerView(frame: .zero)
+    private weak var session: PlaybackSession?
+    private var didResizeWindow = false
+
+    init(title: String, session: PlaybackSession) {
+        self.session = session
+        super.init(window: Self.makeWindow(title: title))
+        configureWindow()
+        configureContentView()
+        playerView.player = session.player
+    }
+
+    @available(*, unavailable)
     required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        setup()
+        nil
     }
 
-    private func setup() {
-        translatesAutoresizingMaskIntoConstraints = false
-        wantsLayer = true
-        drawsBackground = true
-        backgroundColor = Constants.Playlist.background
-        hasVerticalScroller = true
-        isHidden = true
-
-        let column = NSTableColumn(identifier: Constants.Playlist.columnID)
-        column.width = Constants.Playlist.columnWidth
-        column.title = "Playlist"
-
-        table.addTableColumn(column)
-        table.delegate = self
-        table.dataSource = self
-        table.headerView = nil
-        table.backgroundColor = .clear
-        table.appearance = NSAppearance(named: .darkAqua)
-        table.style = .fullWidth
-        table.selectionHighlightStyle = .regular
-
-        documentView = table
+    func show() {
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
     }
 
-    func syncSelection(to index: Int) {
-        suppressSelectionCallback = true
-        table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-        table.scrollRowToVisible(index)
-        suppressSelectionCallback = false
-    }
-
-    // MARK: NSTableViewDataSource
-
-    func numberOfRows(in tableView: NSTableView) -> Int { urls.count }
-
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let cell = (tableView.makeView(withIdentifier: Constants.Playlist.cellID, owner: self) as? NSTableCellView)
-            ?? makeCell()
-        configure(cell: cell, row: row)
-        return cell
-    }
-
-    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        Constants.Playlist.rowHeight
-    }
-
-    func tableViewSelectionDidChange(_ notification: Notification) {
-        guard !suppressSelectionCallback else { return }
-        let row = table.selectedRow
-        guard urls.indices.contains(row), row != currentIndex else { return }
-        onSelection?(row)
-    }
-
-    // MARK: Cell
-
-    private func makeCell() -> NSTableCellView {
-        let cell = NSTableCellView()
-        cell.identifier = Constants.Playlist.cellID
-
-        let label = NSTextField(labelWithString: "")
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.lineBreakMode = .byTruncatingMiddle
-        label.maximumNumberOfLines = 1
-        cell.textField = label
-        cell.addSubview(label)
-
-        NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
-            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
-            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
-        ])
-
-        return cell
-    }
-
-    private func configure(cell: NSTableCellView, row: Int) {
-        let isCurrent = row == currentIndex
-        cell.textField?.stringValue = urls[row].lastPathComponent
-        cell.textField?.textColor = isCurrent ? .systemYellow : .white
-        cell.textField?.font = isCurrent
-            ? .boldSystemFont(ofSize: Constants.Playlist.fontSize)
-            : .systemFont(ofSize: Constants.Playlist.fontSize)
-    }
-}
-
-// MARK: - AppDelegate
-
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-
-    private var window: NSWindow!
-    private var playerView: AVPlayerView!
-    private let controller = PlayerController()
-    private let panel = PlaylistPanel()
-
-    private var cursorTimer: Timer?
-    private var eventMonitors: [Any] = []
-
-    init(url: URL) {
-        super.init()
-        let playlist = Playlist.build(from: url)
-        controller.load(playlist: playlist)
-    }
-
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        buildWindow()
-        buildPlayerView()
-        buildPlaylistPanel()
-
-        playerView.player = controller.player
-        refreshPlaylistPanel()
-
-        controller.onTrackChange = { [weak self] index, url in
-            self?.handleTrackChange(index: index, url: url)
+    func applyPreferredWindowSize(for presentationSize: CGSize) {
+        guard !didResizeWindow, let window, presentationSize.width > 0, presentationSize.height > 0 else {
+            return
         }
 
-        window.makeKeyAndOrderFront(nil)
-        window.toggleFullScreen(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        didResizeWindow = true
 
-        installKeyboardMonitor()
-        installMouseMonitor()
-        scheduleCursorHide()
+        let contentSize = fittedContentSize(for: presentationSize, in: window)
+        let targetContentRect = NSRect(origin: .zero, size: contentSize)
+        let targetFrame = window.frameRect(forContentRect: targetContentRect)
+        let currentFrame = window.frame
+        let newOrigin = NSPoint(
+            x: currentFrame.midX - (targetFrame.width / 2),
+            y: currentFrame.midY - (targetFrame.height / 2)
+        )
+        let newFrame = NSRect(origin: newOrigin, size: targetFrame.size)
+
+        window.setFrame(newFrame, display: true, animate: false)
     }
 
-    // MARK: Window & View Setup
+    func windowWillClose(_ notification: Notification) {
+        session?.pause()
+    }
 
-    private func buildWindow() {
-        window = NSWindow(
-            contentRect: Constants.Window.defaultFrame,
-            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+    private static func makeWindow(title: String) -> NSWindow {
+        let window = NSWindow(
+            contentRect: Defaults.initialWindowRect,
+            styleMask: Defaults.windowStyle,
             backing: .buffered,
             defer: false
         )
+        window.title = title
+        window.collectionBehavior = [.fullScreenPrimary]
         window.backgroundColor = .black
-        window.collectionBehavior = .fullScreenPrimary
-        window.acceptsMouseMovedEvents = true
-        window.center()
+        return window
+    }
+
+    private func configureWindow() {
+        guard let window else { return }
         window.delegate = self
-        updateWindowTitle()
+        window.center()
+        window.minSize = Defaults.minimumContentSize
+        window.isReleasedWhenClosed = false
+        window.tabbingMode = .disallowed
+        window.acceptsMouseMovedEvents = false
+        window.titleVisibility = .visible
     }
 
-    private func buildPlayerView() {
-        guard let content = window.contentView else { return }
-        playerView = AVPlayerView(frame: content.bounds)
-        playerView.autoresizingMask = [.width, .height]
+    private func configureContentView() {
+        guard let window else { return }
+
+        let containerView = NSView(frame: Defaults.initialWindowRect)
+        containerView.wantsLayer = true
+        containerView.layer?.backgroundColor = NSColor.black.cgColor
+
+        playerView.translatesAutoresizingMaskIntoConstraints = false
         playerView.controlsStyle = .floating
-        content.addSubview(playerView)
-    }
+        playerView.videoGravity = .resizeAspect
+        playerView.allowsPictureInPicturePlayback = false
+        playerView.showsFullScreenToggleButton = true
 
-    private func buildPlaylistPanel() {
-        guard let content = window.contentView else { return }
-        content.addSubview(panel, positioned: .above, relativeTo: nil)
-
+        containerView.addSubview(playerView)
         NSLayoutConstraint.activate([
-            panel.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            panel.topAnchor.constraint(equalTo: content.topAnchor),
-            panel.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            panel.widthAnchor.constraint(equalToConstant: Constants.Playlist.panelWidth)
+            playerView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
+            playerView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
+            playerView.topAnchor.constraint(equalTo: containerView.topAnchor),
+            playerView.bottomAnchor.constraint(equalTo: containerView.bottomAnchor)
         ])
 
-        panel.onSelection = { [weak self] index in
-            self?.controller.play(at: index)
-            self?.refreshPlaylistPanel()
+        window.contentView = containerView
+    }
+
+    private func fittedContentSize(for presentationSize: CGSize, in window: NSWindow) -> NSSize {
+        let visibleFrame = window.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+
+        let maxWidth = max(Defaults.minimumContentSize.width, visibleFrame.width * 0.85)
+        let maxHeight = max(Defaults.minimumContentSize.height, visibleFrame.height * 0.85)
+
+        var width = presentationSize.width
+        var height = presentationSize.height
+
+        let scale = min(maxWidth / width, maxHeight / height, 1.0)
+        width *= scale
+        height *= scale
+
+        let aspectRatio = width / height
+        if width < Defaults.minimumContentSize.width {
+            width = Defaults.minimumContentSize.width
+            height = width / aspectRatio
         }
-    }
-
-    // MARK: Track Change
-
-    private func handleTrackChange(index: Int, url: URL) {
-        updateWindowTitle()
-        refreshPlaylistPanel()
-        scheduleCursorHide()
-    }
-
-    private func updateWindowTitle() {
-        guard let url = controller.currentURL else {
-            window.title = Constants.Window.title
-            return
+        if height < Defaults.minimumContentSize.height {
+            height = Defaults.minimumContentSize.height
+            width = height * aspectRatio
         }
-        window.title = "[\(controller.currentIndex + 1)/\(controller.count)] \(url.lastPathComponent)"
+
+        return NSSize(width: round(width), height: round(height))
+    }
+}
+
+private final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
+    private let options: CLIOptions
+    private let mediaURL: URL
+
+    private var session: PlaybackSession?
+    private var windowController: PlayerWindowController?
+
+    init(options: CLIOptions, mediaURL: URL) {
+        self.options = options
+        self.mediaURL = mediaURL
     }
 
-    private func refreshPlaylistPanel() {
-        panel.urls = controller.playlistURLs
-        panel.currentIndex = controller.currentIndex
-        panel.syncSelection(to: controller.currentIndex)
-    }
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.mainMenu = buildMainMenu()
 
-    // MARK: Input
+        let session = PlaybackSession(options: options, mediaURL: mediaURL)
+        let windowController = PlayerWindowController(title: mediaURL.lastPathComponent, session: session)
 
-    private func installKeyboardMonitor() {
-        let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, let shortcut = KeyboardShortcut(event: event) else { return event }
-            self.handle(shortcut)
-            return nil
+        session.onPresentationSizeAvailable = { [weak windowController] size in
+            windowController?.applyPreferredWindowSize(for: size)
         }
-        if let monitor { eventMonitors.append(monitor) }
-    }
 
-    private func installMouseMonitor() {
-        let mask: NSEvent.EventTypeMask = [
-            .mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel
-        ]
-        let monitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
-            self?.scheduleCursorHide()
-            return event
-        }
-        if let monitor { eventMonitors.append(monitor) }
-    }
-
-    private func handle(_ shortcut: KeyboardShortcut) {
-        switch shortcut {
-        case .quit:
+        session.onPlaybackFailure = { message in
+            AppState.exitCode = .software
+            StandardIO.writeErrorLine(PlayerError.playerFailed(message).localizedDescription)
             NSApp.terminate(nil)
-
-        case .toggleFullscreen:
-            window.toggleFullScreen(nil)
-
-        case .togglePlaylist:
-            panel.isHidden.toggle()
-            if !panel.isHidden { refreshPlaylistPanel() }
-            scheduleCursorHide()
-
-        case .deleteCurrent:
-            deleteCurrent()
-
-        case .saveSnapshot:
-            controller.captureSnapshot { outputURL in
-                if let outputURL {
-                    NSSound.beep()
-                    print("Saved: \(outputURL.path)")
-                }
-            }
-
-        case .showMediaInfo:
-            Task {
-                do {
-                    let info = try await controller.buildMediaInfo()
-                    await MainActor.run { self.alert(title: "Media Information", message: info) }
-                } catch {
-                    await MainActor.run { self.alert(title: "Error", message: error.localizedDescription) }
-                }
-            }
-
-        case .next:
-            controller.playNext()
-            refreshPlaylistPanel()
-            updateWindowTitle()
-
-        case .previous:
-            controller.playPrevious()
-            refreshPlaylistPanel()
-            updateWindowTitle()
-
-        case .restart:
-            controller.restart()
-            scheduleCursorHide()
-
-        case .togglePlayback:
-            if controller.player.rate == 0 {
-                controller.player.play()
-                scheduleCursorHide()
-            } else {
-                controller.player.pause()
-                cancelCursorHide()
-            }
-
-        case .seekBackward:
-            controller.seek(by: -Constants.Seek.interval)
-            scheduleCursorHide()
-
-        case .seekForward:
-            controller.seek(by: Constants.Seek.interval)
-            scheduleCursorHide()
         }
-    }
 
-    private func deleteCurrent() {
-        do {
-            try controller.deleteCurrentFile()
-            NSSound.beep()
-
-            if controller.count == 0 {
-                window.title = Constants.Window.title
-                panel.urls = []
-            } else {
-                updateWindowTitle()
-                refreshPlaylistPanel()
-            }
-        } catch {
-            alert(title: "Delete Failed", message: error.localizedDescription)
+        session.onPlaybackFinished = { [weak self] in
+            guard let self = self, self.options.quitWhenFinished else { return }
+            NSApp.terminate(nil)
         }
+
+        self.session = session
+        self.windowController = windowController
+
+        windowController.show()
+        NSApp.activate(ignoringOtherApps: true)
     }
 
-    // MARK: Cursor Auto-Hide
-
-    private func scheduleCursorHide() {
-        cancelCursorHide()
-        guard controller.player.timeControlStatus == .playing else { return }
-
-        cursorTimer = Timer.scheduledTimer(
-            withTimeInterval: Constants.Cursor.hideDelay,
-            repeats: false
-        ) { [weak self] _ in
-            self?.hideCursor()
-        }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
     }
 
-    private func cancelCursorHide() {
-        cursorTimer?.invalidate()
-        cursorTimer = nil
+    @objc
+    private func togglePlayback(_ sender: Any?) {
+        session?.togglePlayback()
     }
 
-    private func hideCursor() {
-        guard controller.player.timeControlStatus == .playing,
-              window?.isKeyWindow == true
-        else { return }
-        NSCursor.setHiddenUntilMouseMoves(true)
+    @objc
+    private func toggleMute(_ sender: Any?) {
+        session?.toggleMute()
     }
 
-    // MARK: Helpers
-
-    private func alert(title: String, message: String) {
-        let a = NSAlert()
-        a.messageText = title
-        a.informativeText = message
-        a.runModal()
+    @objc
+    private func seekBackward(_ sender: Any?) {
+        session?.seek(by: -Defaults.seekStepSeconds)
     }
 
-    // MARK: NSApplicationDelegate
+    @objc
+    private func seekForward(_ sender: Any?) {
+        session?.seek(by: Defaults.seekStepSeconds)
+    }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    private func buildMainMenu() -> NSMenu {
+        let menu = NSMenu()
 
-    func applicationWillTerminate(_ notification: Notification) {
-        cancelCursorHide()
-        eventMonitors.forEach(NSEvent.removeMonitor)
-        eventMonitors.removeAll()
+        let appMenuItem = NSMenuItem()
+        appMenuItem.submenu = buildApplicationMenu()
+        menu.addItem(appMenuItem)
+
+        let playbackMenuItem = NSMenuItem()
+        playbackMenuItem.submenu = buildPlaybackMenu()
+        menu.addItem(playbackMenuItem)
+
+        return menu
+    }
+
+    private func buildApplicationMenu() -> NSMenu {
+        let menu = NSMenu(title: "Application")
+        let appName = ProcessInfo.processInfo.processName
+
+        let quitItem = NSMenuItem(
+            title: "Quit \(appName)",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        quitItem.keyEquivalentModifierMask = [.command]
+        menu.addItem(quitItem)
+
+        return menu
+    }
+
+    private func buildPlaybackMenu() -> NSMenu {
+        let menu = NSMenu(title: "Playback")
+
+        let playPauseItem = NSMenuItem(
+            title: "Play/Pause",
+            action: #selector(togglePlayback(_:)),
+            keyEquivalent: " "
+        )
+        playPauseItem.target = self
+        playPauseItem.keyEquivalentModifierMask = []
+        menu.addItem(playPauseItem)
+
+        let muteItem = NSMenuItem(
+            title: "Mute/Unmute",
+            action: #selector(toggleMute(_:)),
+            keyEquivalent: "m"
+        )
+        muteItem.target = self
+        muteItem.keyEquivalentModifierMask = []
+        menu.addItem(muteItem)
+
+        let seekBackwardItem = NSMenuItem(
+            title: "Back 10 Seconds",
+            action: #selector(seekBackward(_:)),
+            keyEquivalent: "["
+        )
+        seekBackwardItem.target = self
+        seekBackwardItem.keyEquivalentModifierMask = []
+        menu.addItem(seekBackwardItem)
+
+        let seekForwardItem = NSMenuItem(
+            title: "Forward 10 Seconds",
+            action: #selector(seekForward(_:)),
+            keyEquivalent: "]"
+        )
+        seekForwardItem.target = self
+        seekForwardItem.keyEquivalentModifierMask = []
+        menu.addItem(seekForwardItem)
+
+        return menu
     }
 }
 
-// MARK: - Entry Point
-
-private enum CLI {
-    static func resolveURL() -> URL {
-        let args = CommandLine.arguments
-        guard args.count >= 2 else {
-            print("Usage: avplayer <url_or_file_path>")
-            exit(1)
-        }
-
-        let input = args[1]
-
-        guard input.hasPrefix("http://") || input.hasPrefix("https://") else {
-            return URL(fileURLWithPath: input)
-        }
-
-        guard
-            let components = URLComponents(string: input),
-            let scheme = components.scheme?.lowercased(),
-            ["http", "https"].contains(scheme),
-            let host = components.host, !host.isEmpty,
-            let url = components.url
-        else {
-            fputs("Invalid URL: \(input)\n", stderr)
-            exit(1)
-        }
-
-        return url
+private func exitCode(for error: PlayerError) -> ExitCode {
+    switch error {
+    case .missingMediaPath,
+         .invalidOption,
+         .missingOptionValue,
+         .invalidVolume,
+         .invalidStartTime,
+         .tooManyPaths:
+        return .usage
+    case .unsupportedURL,
+         .fileNotFound,
+         .directoryNotSupported,
+         .unreadableFile,
+         .unsupportedFileType:
+        return .unavailable
+    case .playerFailed:
+        return .software
     }
 }
 
-let app = NSApplication.shared
-app.setActivationPolicy(.regular)
+do {
+    let programName = (CommandLine.arguments.first as NSString?)?.lastPathComponent ?? "localplayer"
+    let arguments = Array(CommandLine.arguments.dropFirst())
 
-let appDelegate = AppDelegate(url: CLI.resolveURL())
-app.delegate = appDelegate
-app.run()
+    guard let options = try CLIParser.parse(arguments: arguments) else {
+        StandardIO.writeLine(CLIOptions.usage(programName: programName))
+        Foundation.exit(ExitCode.success.rawValue)
+    }
+
+    let mediaURL = try MediaLocator.resolve(from: options.mediaPath)
+
+    let application = NSApplication.shared
+    application.setActivationPolicy(.regular)
+
+    let coordinator = ApplicationCoordinator(options: options, mediaURL: mediaURL)
+    application.delegate = coordinator
+    application.run()
+
+    Foundation.exit(AppState.exitCode.rawValue)
+} catch let error as PlayerError {
+    StandardIO.writeErrorLine(error.localizedDescription)
+    StandardIO.writeErrorLine("")
+    StandardIO.writeErrorLine(CLIOptions.usage(programName: ProcessInfo.processInfo.processName))
+    Foundation.exit(exitCode(for: error).rawValue)
+} catch {
+    StandardIO.writeErrorLine(error.localizedDescription)
+    Foundation.exit(ExitCode.software.rawValue)
+}
