@@ -760,9 +760,13 @@ private final class PlayerApplication: NSObject, NSApplicationDelegate, NSWindow
 
             do {
                 let information = try await MediaInformationBuilder.build(for: currentItem.asset, sourceURL: currentURL)
-                await self.presentAlert(title: "Media Information", message: information)
+                await MainActor.run {
+                    self.presentAlert(title: "Media Information", message: information)
+                }
             } catch {
-                await self.presentAlert(title: "Media Information", message: error.localizedDescription)
+                await MainActor.run {
+                    self.presentAlert(title: "Media Information", message: error.localizedDescription)
+                }
             }
         }
     }
