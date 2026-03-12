@@ -20,6 +20,9 @@ private enum Defaults {
     static let minimumContentSize = NSSize(width: 480, height: 270)
     static let seekStepSeconds = 10.0
     static let timeScale: CMTimeScale = 600
+    static let autoFullScreenRetryDelay: TimeInterval = 0.1
+    static let autoFullScreenVerificationDelay: TimeInterval = 0.25
+    static let maxAutoFullScreenRetries = 20
     static let windowStyle: NSWindow.StyleMask = [
         .titled,
         .closable,
@@ -433,6 +436,10 @@ private final class PlayerWindowController: NSWindowController, NSWindowDelegate
     private let playerView = AVPlayerView(frame: .zero)
     private weak var session: PlaybackSession?
     private var didResizeWindow = false
+    private var shouldAutoEnterFullScreen = true
+    private var autoFullScreenAttemptInFlight = false
+    private var autoFullScreenRetryCount = 0
+    private var isFullScreenTransitionInProgress = false
 
     init(title: String, session: PlaybackSession) {
         self.session = session
@@ -449,7 +456,20 @@ private final class PlayerWindowController: NSWindowController, NSWindowDelegate
 
     func show() {
         showWindow(nil)
-        window?.makeKeyAndOrderFront(nil)
+        guard let window else { return }
+        window.makeKeyAndOrderFront(nil)
+        enterFullScreenIfNeeded()
+    }
+
+    func enterFullScreenIfNeeded() {
+        attemptAutoEnterFullScreen()
+    }
+
+    func toggleFullScreen() {
+        guard let window, !isFullScreenTransitionInProgress else { return }
+        shouldAutoEnterFullScreen = false
+        autoFullScreenAttemptInFlight = false
+        window.toggleFullScreen(nil)
     }
 
     func applyPreferredWindowSize(for presentationSize: CGSize) {
@@ -474,6 +494,30 @@ private final class PlayerWindowController: NSWindowController, NSWindowDelegate
 
     func windowWillClose(_ notification: Notification) {
         session?.pause()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        enterFullScreenIfNeeded()
+    }
+
+    func windowWillEnterFullScreen(_ notification: Notification) {
+        isFullScreenTransitionInProgress = true
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        isFullScreenTransitionInProgress = false
+        shouldAutoEnterFullScreen = false
+        autoFullScreenAttemptInFlight = false
+        autoFullScreenRetryCount = 0
+    }
+
+    func windowWillExitFullScreen(_ notification: Notification) {
+        isFullScreenTransitionInProgress = true
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        isFullScreenTransitionInProgress = false
+        autoFullScreenAttemptInFlight = false
     }
 
     private static func makeWindow(title: String) -> NSWindow {
@@ -524,6 +568,62 @@ private final class PlayerWindowController: NSWindowController, NSWindowDelegate
         window.contentView = containerView
     }
 
+    private func attemptAutoEnterFullScreen() {
+        guard shouldAutoEnterFullScreen, let window else { return }
+
+        if window.styleMask.contains(.fullScreen) {
+            shouldAutoEnterFullScreen = false
+            autoFullScreenAttemptInFlight = false
+            autoFullScreenRetryCount = 0
+            return
+        }
+
+        guard !autoFullScreenAttemptInFlight, !isFullScreenTransitionInProgress else {
+            return
+        }
+
+        guard window.isVisible, window.screen != nil, NSApp.isActive else {
+            scheduleAutoFullScreenRetry()
+            return
+        }
+
+        autoFullScreenAttemptInFlight = true
+        window.toggleFullScreen(nil)
+        scheduleAutoFullScreenVerification()
+    }
+
+    private func scheduleAutoFullScreenRetry() {
+        guard shouldAutoEnterFullScreen, autoFullScreenRetryCount < Defaults.maxAutoFullScreenRetries else {
+            return
+        }
+
+        autoFullScreenRetryCount += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + Defaults.autoFullScreenRetryDelay) { [weak self] in
+            self?.attemptAutoEnterFullScreen()
+        }
+    }
+
+    private func scheduleAutoFullScreenVerification() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Defaults.autoFullScreenVerificationDelay) { [weak self] in
+            guard let self, let window = self.window else { return }
+
+            if window.styleMask.contains(.fullScreen) {
+                self.shouldAutoEnterFullScreen = false
+                self.autoFullScreenAttemptInFlight = false
+                self.autoFullScreenRetryCount = 0
+                return
+            }
+
+            if self.isFullScreenTransitionInProgress {
+                self.scheduleAutoFullScreenVerification()
+                return
+            }
+
+            self.autoFullScreenAttemptInFlight = false
+            self.scheduleAutoFullScreenRetry()
+        }
+    }
+
     private func fittedContentSize(for presentationSize: CGSize, in window: NSWindow) -> NSSize {
         let visibleFrame = window.screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
@@ -559,6 +659,7 @@ private final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
 
     private var session: PlaybackSession?
     private var windowController: PlayerWindowController?
+    private var keyEventMonitor: Any?
 
     init(options: CLIOptions, mediaURL: URL) {
         self.options = options
@@ -589,8 +690,24 @@ private final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
         self.session = session
         self.windowController = windowController
 
+        installKeyboardShortcuts()
         windowController.show()
         NSApp.activate(ignoringOtherApps: true)
+
+        DispatchQueue.main.async { [weak self] in
+            self?.windowController?.enterFullScreenIfNeeded()
+        }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        windowController?.enterFullScreenIfNeeded()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let keyEventMonitor {
+            NSEvent.removeMonitor(keyEventMonitor)
+        }
+        keyEventMonitor = nil
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -617,6 +734,60 @@ private final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
         session?.seek(by: Defaults.seekStepSeconds)
     }
 
+    @objc
+    private func toggleFullScreen(_ sender: Any?) {
+        windowController?.toggleFullScreen()
+    }
+
+    @objc
+    private func quit(_ sender: Any?) {
+        NSApp.terminate(nil)
+    }
+
+    private func installKeyboardShortcuts() {
+        guard keyEventMonitor == nil else { return }
+
+        keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            return self.handleKeyDown(event)
+        }
+    }
+
+    private func handleKeyDown(_ event: NSEvent) -> NSEvent? {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let allowedModifiers = modifiers.subtracting([.numericPad, .function])
+        guard allowedModifiers.isEmpty else { return event }
+
+        switch event.keyCode {
+        case 123:
+            seekBackward(nil)
+            return nil
+        case 124:
+            seekForward(nil)
+            return nil
+        default:
+            break
+        }
+
+        guard let characters = event.charactersIgnoringModifiers?.lowercased() else {
+            return event
+        }
+
+        switch characters {
+        case " ":
+            togglePlayback(nil)
+            return nil
+        case "f":
+            toggleFullScreen(nil)
+            return nil
+        case "q":
+            quit(nil)
+            return nil
+        default:
+            return event
+        }
+    }
+
     private func buildMainMenu() -> NSMenu {
         let menu = NSMenu()
 
@@ -637,10 +808,11 @@ private final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
 
         let quitItem = NSMenuItem(
             title: "Quit \(appName)",
-            action: #selector(NSApplication.terminate(_:)),
+            action: #selector(quit(_:)),
             keyEquivalent: "q"
         )
-        quitItem.keyEquivalentModifierMask = [.command]
+        quitItem.target = self
+        quitItem.keyEquivalentModifierMask = []
         menu.addItem(quitItem)
 
         return menu
@@ -684,6 +856,15 @@ private final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
         seekForwardItem.target = self
         seekForwardItem.keyEquivalentModifierMask = []
         menu.addItem(seekForwardItem)
+
+        let fullScreenItem = NSMenuItem(
+            title: "Toggle Full Screen",
+            action: #selector(toggleFullScreen(_:)),
+            keyEquivalent: "f"
+        )
+        fullScreenItem.target = self
+        fullScreenItem.keyEquivalentModifierMask = []
+        menu.addItem(fullScreenItem)
 
         return menu
     }
