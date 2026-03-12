@@ -1,920 +1,565 @@
-// Build example:
-// swiftc -O -framework Cocoa -framework AVFoundation -framework AVKit -framework UniformTypeIdentifiers main.swift -o localplayer
-
+import AppKit
 import AVFoundation
-import AVKit
-import Cocoa
-import CoreMedia
-import Foundation
 import UniformTypeIdentifiers
 
-private enum ExitCode: Int32 {
-    case success = 0
-    case usage = 64
-    case unavailable = 69
-    case software = 70
-}
+final class PlayerRenderView: NSView {
+    var onURLDropped: ((URL) -> Void)?
 
-private enum Defaults {
-    static let initialWindowRect = NSRect(x: 0, y: 0, width: 960, height: 540)
-    static let minimumContentSize = NSSize(width: 480, height: 270)
-    static let seekStepSeconds = 10.0
-    static let timeScale: CMTimeScale = 600
-    static let autoFullScreenRetryDelay: TimeInterval = 0.1
-    static let autoFullScreenVerificationDelay: TimeInterval = 0.25
-    static let maxAutoFullScreenRetries = 20
-    static let windowStyle: NSWindow.StyleMask = [
-        .titled,
-        .closable,
-        .miniaturizable,
-        .resizable
-    ]
-}
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        registerForDraggedTypes([.fileURL])
+    }
 
-private enum AppState {
-    static var exitCode: ExitCode = .success
-}
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
-private enum PlayerError: LocalizedError {
-    case missingMediaPath
-    case invalidOption(String)
-    case missingOptionValue(String)
-    case invalidVolume(String)
-    case invalidStartTime(String)
-    case tooManyPaths
-    case unsupportedURL(String)
-    case fileNotFound(String)
-    case directoryNotSupported(String)
-    case unreadableFile(String)
-    case unsupportedFileType(String)
-    case playerFailed(String)
+    override func makeBackingLayer() -> CALayer {
+        AVPlayerLayer()
+    }
 
-    var errorDescription: String? {
-        switch self {
-        case .missingMediaPath:
-            return "Missing local media path."
-        case let .invalidOption(option):
-            return "Unknown option: \(option)"
-        case let .missingOptionValue(option):
-            return "Missing value for option: \(option)"
-        case let .invalidVolume(value):
-            return "Invalid volume '\(value)'. Expected a number between 0 and 1."
-        case let .invalidStartTime(value):
-            return "Invalid start time '\(value)'. Expected a non-negative number of seconds."
-        case .tooManyPaths:
-            return "Only one media file can be played at a time."
-        case let .unsupportedURL(value):
-            return "Only local file paths or file:// URLs are supported: \(value)"
-        case let .fileNotFound(path):
-            return "File does not exist: \(path)"
-        case let .directoryNotSupported(path):
-            return "Directories are not supported: \(path)"
-        case let .unreadableFile(path):
-            return "File is not readable: \(path)"
-        case let .unsupportedFileType(path):
-            return "Unsupported media type: \(path)"
-        case let .playerFailed(message):
-            return "Playback failed: \(message)"
+    var playerLayer: AVPlayerLayer {
+        layer as! AVPlayerLayer
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        sender.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: nil) ? .copy : []
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard
+            let items = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
+            let url = items.first
+        else {
+            return false
         }
+
+        onURLDropped?(url)
+        return true
     }
 }
 
-private struct CLIOptions {
-    let mediaPath: String
-    let autoplay: Bool
-    let loopPlayback: Bool
-    let quitWhenFinished: Bool
-    let muted: Bool
-    let volume: Float
-    let startAtSeconds: Double
+final class PlayerWindow: NSWindow {
+    var eventHandler: ((NSEvent) -> Bool)?
 
-    static func usage(programName: String) -> String {
-        """
-        Usage:
-          \(programName) [options] <local-media-file>
-
-        Options:
-          --loop                 Restart automatically when playback reaches the end.
-          --no-autoplay          Open the window without starting playback.
-          --quit-when-finished   Exit the app when playback completes.
-          --mute                 Start muted.
-          --volume <0...1>       Initial output volume. Default: 1.0
-          --start-at <seconds>   Seek to a start position before playback begins.
-          -h, --help             Show this help message.
-
-        Notes:
-          - Only local files are supported.
-          - This player is intentionally event-driven for low energy use:
-            no polling timers, no periodic observers, and one-time window sizing.
-        """
+    override func keyDown(with event: NSEvent) {
+        if eventHandler?(event) == true {
+            return
+        }
+        super.keyDown(with: event)
     }
 }
 
-private enum CLIParser {
-    static func parse(arguments: [String]) throws -> CLIOptions? {
-        var autoplay = true
-        var loopPlayback = false
-        var quitWhenFinished = false
-        var muted = false
-        var volume: Float = 1.0
-        var startAtSeconds = 0.0
-        var mediaPath: String?
-        var index = 0
-        var stopParsingOptions = false
+final class PlayerWindowController: NSWindowController, NSWindowDelegate {
+    private let player = AVPlayer()
+    private let renderView = PlayerRenderView(frame: .zero)
+    private let overlayLabel = NSTextField(labelWithString: "拖入视频或按 ⌘O 打开")
+    private let hintLabel = NSTextField(labelWithString: "Space 播放/暂停  ←/→ 快退快进  ↑/↓ 音量  F 全屏  M 静音")
 
-        while index < arguments.count {
-            let argument = arguments[index]
+    private let openButton = NSButton(title: "打开", target: nil, action: nil)
+    private let playPauseButton = NSButton(title: "播放", target: nil, action: nil)
+    private let muteButton = NSButton(title: "静音", target: nil, action: nil)
+    private let progressSlider = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let timeLabel = NSTextField(labelWithString: "00:00 / 00:00")
 
-            if stopParsingOptions {
-                if mediaPath == nil {
-                    mediaPath = argument
-                } else {
-                    throw PlayerError.tooManyPaths
-                }
-                index += 1
-                continue
-            }
+    private var timeObserver: Any?
+    private var rateObservation: NSKeyValueObservation?
+    private var statusObservation: NSKeyValueObservation?
+    private var keepTimeUpdatesSuspended = false
 
-            switch argument {
-            case "-h", "--help":
-                return nil
-            case "--":
-                stopParsingOptions = true
-            case "--loop":
-                loopPlayback = true
-            case "--no-autoplay":
-                autoplay = false
-            case "--quit-when-finished":
-                quitWhenFinished = true
-            case "--mute":
-                muted = true
-            case "--volume":
-                let value = try nextValue(after: &index, in: arguments, option: argument)
-                guard let parsed = Float(value), (0...1).contains(parsed) else {
-                    throw PlayerError.invalidVolume(value)
-                }
-                volume = parsed
-            case "--start-at":
-                let value = try nextValue(after: &index, in: arguments, option: argument)
-                guard let parsed = Double(value), parsed >= 0 else {
-                    throw PlayerError.invalidStartTime(value)
-                }
-                startAtSeconds = parsed
-            default:
-                if argument.hasPrefix("-") {
-                    throw PlayerError.invalidOption(argument)
-                }
-                if mediaPath == nil {
-                    mediaPath = argument
-                } else {
-                    throw PlayerError.tooManyPaths
-                }
-            }
-
-            index += 1
-        }
-
-        guard let mediaPath else {
-            throw PlayerError.missingMediaPath
-        }
-
-        return CLIOptions(
-            mediaPath: mediaPath,
-            autoplay: autoplay,
-            loopPlayback: loopPlayback,
-            quitWhenFinished: quitWhenFinished,
-            muted: muted,
-            volume: volume,
-            startAtSeconds: startAtSeconds
+    init() {
+        let window = PlayerWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 720),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
         )
+        window.title = "Low Power Player"
+        window.minSize = NSSize(width: 720, height: 420)
+        window.center()
+        window.backgroundColor = .black
+        window.isReleasedWhenClosed = false
+        super.init(window: window)
+        setupPlayer()
+        setupUI()
+        setupObservers()
+        bindActions()
     }
 
-    private static func nextValue(
-        after index: inout Int,
-        in arguments: [String],
-        option: String
-    ) throws -> String {
-        let nextIndex = index + 1
-        guard nextIndex < arguments.count else {
-            throw PlayerError.missingOptionValue(option)
-        }
-        index = nextIndex
-        return arguments[nextIndex]
-    }
-}
-
-private struct MediaLocator {
-    static func resolve(from rawPath: String) throws -> URL {
-        let url: URL
-        if rawPath.contains("://") {
-            guard let parsed = URL(string: rawPath), parsed.isFileURL else {
-                throw PlayerError.unsupportedURL(rawPath)
-            }
-            url = parsed
-        } else {
-            let expandedPath = (rawPath as NSString).expandingTildeInPath
-            if expandedPath.hasPrefix("/") {
-                url = URL(fileURLWithPath: expandedPath)
-            } else {
-                let cwd = FileManager.default.currentDirectoryPath
-                url = URL(fileURLWithPath: cwd).appendingPathComponent(expandedPath)
-            }
-        }
-
-        let standardizedURL = url.standardizedFileURL
-        var isDirectory: ObjCBool = false
-        let path = standardizedURL.path
-
-        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else {
-            throw PlayerError.fileNotFound(path)
-        }
-        guard !isDirectory.boolValue else {
-            throw PlayerError.directoryNotSupported(path)
-        }
-        guard FileManager.default.isReadableFile(atPath: path) else {
-            throw PlayerError.unreadableFile(path)
-        }
-        guard isLikelySupportedMedia(url: standardizedURL) else {
-            throw PlayerError.unsupportedFileType(path)
-        }
-
-        return standardizedURL
-    }
-
-    private static func isLikelySupportedMedia(url: URL) -> Bool {
-        let pathExtension = url.pathExtension
-        guard !pathExtension.isEmpty else {
-            return true
-        }
-        guard let type = UTType(filenameExtension: pathExtension) else {
-            return true
-        }
-        return type.conforms(to: .movie) || type.conforms(to: .audio) || type.conforms(to: .mpeg4Movie)
-    }
-}
-
-private enum StandardIO {
-    static func writeLine(_ message: String) {
-        write(message + "\n", to: FileHandle.standardOutput)
-    }
-
-    static func writeErrorLine(_ message: String) {
-        write(message + "\n", to: FileHandle.standardError)
-    }
-
-    private static func write(_ message: String, to handle: FileHandle) {
-        guard let data = message.data(using: .utf8) else { return }
-        try? handle.write(contentsOf: data)
-    }
-}
-
-private final class PlaybackSession {
-    let player: AVPlayer
-
-    var onPresentationSizeAvailable: ((CGSize) -> Void)?
-    var onPlaybackFailure: ((String) -> Void)?
-    var onPlaybackFinished: (() -> Void)?
-
-    private let options: CLIOptions
-    private let item: AVPlayerItem
-
-    private var itemStatusObservation: NSKeyValueObservation?
-    private var presentationSizeObservation: NSKeyValueObservation?
-    private var itemEndObserver: NSObjectProtocol?
-
-    private var didPreparePlayback = false
-    private var didPublishPresentationSize = false
-
-    init(options: CLIOptions, mediaURL: URL) {
-        self.options = options
-
-        let asset = AVURLAsset(
-            url: mediaURL,
-            options: [AVURLAssetPreferPreciseDurationAndTimingKey: false]
-        )
-
-        let item = AVPlayerItem(asset: asset)
-        item.canUseNetworkResourcesForLiveStreamingWhilePaused = false
-        item.preferredForwardBufferDuration = 0
-
-        let player = AVPlayer(playerItem: item)
-        player.actionAtItemEnd = options.loopPlayback ? .none : .pause
-        player.automaticallyWaitsToMinimizeStalling = true
-        player.allowsExternalPlayback = false
-        player.preventsDisplaySleepDuringVideoPlayback = false
-        player.isMuted = options.muted
-        player.volume = options.volume
-
-        self.item = item
-        self.player = player
-
-        beginObserving()
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
     }
 
     deinit {
-        tearDown()
-    }
-
-    func playIfNeeded() {
-        guard options.autoplay else { return }
-        player.play()
-    }
-
-    func togglePlayback() {
-        if player.timeControlStatus == .paused {
-            player.play()
-        } else {
-            player.pause()
+        if let timeObserver {
+            player.removeTimeObserver(timeObserver)
         }
-    }
-
-    func pause() {
-        player.pause()
-    }
-
-    func toggleMute() {
-        player.isMuted.toggle()
-    }
-
-    func seek(by deltaSeconds: Double) {
-        let currentSeconds = player.currentTime().seconds
-        let safeCurrentSeconds = currentSeconds.isFinite ? currentSeconds : 0
-        let targetSeconds = max(0, safeCurrentSeconds + deltaSeconds)
-        let target = CMTime(seconds: targetSeconds, preferredTimescale: Defaults.timeScale)
-
-        player.seek(
-            to: target,
-            toleranceBefore: .positiveInfinity,
-            toleranceAfter: .positiveInfinity
-        )
-    }
-
-    private func beginObserving() {
-        itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-            self?.handleItemStatus(item.status)
-        }
-
-        presentationSizeObservation = item.observe(\.presentationSize, options: [.new]) { [weak self] item, _ in
-            self?.handlePresentationSize(item.presentationSize)
-        }
-
-        itemEndObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: item,
-            queue: .main
-        ) { [weak self] _ in
-            self?.handleItemEnded()
-        }
-    }
-
-    private func handleItemStatus(_ status: AVPlayerItem.Status) {
-        switch status {
-        case .readyToPlay:
-            preparePlaybackIfNeeded()
-        case .failed:
-            let message = item.error?.localizedDescription ?? "Unknown AVPlayerItem failure."
-            onPlaybackFailure?(message)
-        case .unknown:
-            break
-        @unknown default:
-            break
-        }
-    }
-
-    private func preparePlaybackIfNeeded() {
-        guard !didPreparePlayback else { return }
-        didPreparePlayback = true
-
-        let startTime = options.startAtSeconds
-        guard startTime > 0 else {
-            playIfNeeded()
-            return
-        }
-
-        let target = CMTime(seconds: startTime, preferredTimescale: Defaults.timeScale)
-        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-            self?.playIfNeeded()
-        }
-    }
-
-    private func handlePresentationSize(_ size: CGSize) {
-        guard !didPublishPresentationSize, size.width > 0, size.height > 0 else {
-            return
-        }
-
-        didPublishPresentationSize = true
-        player.preventsDisplaySleepDuringVideoPlayback = true
-        onPresentationSizeAvailable?(size)
-
-        // Window sizing only needs the first stable presentation size.
-        presentationSizeObservation = nil
-    }
-
-    private func handleItemEnded() {
-        if options.loopPlayback {
-            player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-                self?.player.play()
-            }
-            return
-        }
-
-        onPlaybackFinished?()
-    }
-
-    private func tearDown() {
-        if let itemEndObserver {
-            NotificationCenter.default.removeObserver(itemEndObserver)
-        }
-        itemEndObserver = nil
-        itemStatusObservation = nil
-        presentationSizeObservation = nil
-        player.pause()
-    }
-}
-
-private final class PlayerWindowController: NSWindowController, NSWindowDelegate {
-    private let playerView = AVPlayerView(frame: .zero)
-    private weak var session: PlaybackSession?
-    private var didResizeWindow = false
-    private var shouldAutoEnterFullScreen = true
-    private var autoFullScreenAttemptInFlight = false
-    private var autoFullScreenRetryCount = 0
-    private var isFullScreenTransitionInProgress = false
-
-    init(title: String, session: PlaybackSession) {
-        self.session = session
-        super.init(window: Self.makeWindow(title: title))
-        configureWindow()
-        configureContentView()
-        playerView.player = session.player
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        nil
     }
 
     func show() {
         showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func openDocument() {
         guard let window else { return }
-        window.makeKeyAndOrderFront(nil)
-        enterFullScreenIfNeeded()
-    }
 
-    func enterFullScreenIfNeeded() {
-        attemptAutoEnterFullScreen()
-    }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.movie, .video]
 
-    func toggleFullScreen() {
-        guard let window, !isFullScreenTransitionInProgress else { return }
-        shouldAutoEnterFullScreen = false
-        autoFullScreenAttemptInFlight = false
-        window.toggleFullScreen(nil)
-    }
-
-    func applyPreferredWindowSize(for presentationSize: CGSize) {
-        guard !didResizeWindow, let window, presentationSize.width > 0, presentationSize.height > 0 else {
-            return
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.load(url: url, autoplay: true)
         }
-
-        didResizeWindow = true
-
-        let contentSize = fittedContentSize(for: presentationSize, in: window)
-        let targetContentRect = NSRect(origin: .zero, size: contentSize)
-        let targetFrame = window.frameRect(forContentRect: targetContentRect)
-        let currentFrame = window.frame
-        let newOrigin = NSPoint(
-            x: currentFrame.midX - (targetFrame.width / 2),
-            y: currentFrame.midY - (targetFrame.height / 2)
-        )
-        let newFrame = NSRect(origin: newOrigin, size: targetFrame.size)
-
-        window.setFrame(newFrame, display: true, animate: false)
     }
 
-    func windowWillClose(_ notification: Notification) {
-        session?.pause()
+    func togglePlayPause() {
+        switch player.timeControlStatus {
+        case .paused:
+            player.play()
+        default:
+            player.pause()
+        }
     }
 
-    func windowDidBecomeKey(_ notification: Notification) {
-        enterFullScreenIfNeeded()
+    func seek(by seconds: Double) {
+        guard let item = player.currentItem else { return }
+        let duration = item.duration.secondsValue
+        guard duration > 0 else { return }
+
+        let current = player.currentTime().secondsValue
+        let target = min(max(current + seconds, 0), duration)
+        let time = CMTime(seconds: target, preferredTimescale: 600)
+        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
-    func windowWillEnterFullScreen(_ notification: Notification) {
-        isFullScreenTransitionInProgress = true
+    func adjustVolume(by delta: Float) {
+        let value = min(max(player.volume + delta, 0), 1)
+        player.volume = value
+        player.isMuted = value == 0
+        updateMuteButton()
     }
 
-    func windowDidEnterFullScreen(_ notification: Notification) {
-        isFullScreenTransitionInProgress = false
-        shouldAutoEnterFullScreen = false
-        autoFullScreenAttemptInFlight = false
-        autoFullScreenRetryCount = 0
+    func toggleMute() {
+        player.isMuted.toggle()
+        updateMuteButton()
     }
 
-    func windowWillExitFullScreen(_ notification: Notification) {
-        isFullScreenTransitionInProgress = true
-    }
-
-    func windowDidExitFullScreen(_ notification: Notification) {
-        isFullScreenTransitionInProgress = false
-        autoFullScreenAttemptInFlight = false
-    }
-
-    private static func makeWindow(title: String) -> NSWindow {
-        let window = NSWindow(
-            contentRect: Defaults.initialWindowRect,
-            styleMask: Defaults.windowStyle,
-            backing: .buffered,
-            defer: false
-        )
-        window.title = title
-        window.collectionBehavior = [.fullScreenPrimary]
-        window.backgroundColor = .black
-        return window
-    }
-
-    private func configureWindow() {
+    func stopForPowerSavingIfNeeded() {
         guard let window else { return }
-        window.delegate = self
-        window.center()
-        window.minSize = Defaults.minimumContentSize
-        window.isReleasedWhenClosed = false
-        window.tabbingMode = .disallowed
-        window.acceptsMouseMovedEvents = false
-        window.titleVisibility = .visible
+        if window.isMiniaturized || !window.occlusionState.contains(.visible) {
+            player.pause()
+        }
     }
 
-    private func configureContentView() {
-        guard let window else { return }
+    private func setupPlayer() {
+        player.automaticallyWaitsToMinimizeStalling = true
+        player.volume = 1
+        renderView.playerLayer.player = player
+        renderView.playerLayer.videoGravity = .resizeAspect
+        renderView.playerLayer.needsDisplayOnBoundsChange = false
+        renderView.onURLDropped = { [weak self] url in
+            self?.load(url: url, autoplay: true)
+        }
+    }
 
-        let containerView = NSView(frame: Defaults.initialWindowRect)
-        containerView.wantsLayer = true
-        containerView.layer?.backgroundColor = NSColor.black.cgColor
+    private func setupUI() {
+        guard let contentView = window?.contentView else { return }
 
-        playerView.translatesAutoresizingMaskIntoConstraints = false
-        playerView.controlsStyle = .floating
-        playerView.videoGravity = .resizeAspect
-        playerView.allowsPictureInPicturePlayback = false
-        playerView.showsFullScreenToggleButton = true
+        let root = NSView()
+        root.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(root)
 
-        containerView.addSubview(playerView)
+        renderView.translatesAutoresizingMaskIntoConstraints = false
+        overlayLabel.translatesAutoresizingMaskIntoConstraints = false
+        hintLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        overlayLabel.font = .systemFont(ofSize: 28, weight: .semibold)
+        overlayLabel.textColor = NSColor.white.withAlphaComponent(0.92)
+        overlayLabel.alignment = .center
+        overlayLabel.lineBreakMode = .byWordWrapping
+        overlayLabel.backgroundColor = .clear
+
+        hintLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        hintLabel.textColor = NSColor.white.withAlphaComponent(0.72)
+        hintLabel.alignment = .center
+        hintLabel.backgroundColor = .clear
+
+        openButton.bezelStyle = .rounded
+        playPauseButton.bezelStyle = .rounded
+        muteButton.bezelStyle = .rounded
+        timeLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        timeLabel.textColor = .secondaryLabelColor
+
+        progressSlider.isContinuous = false
+        progressSlider.controlSize = .small
+
+        let controls = NSStackView(views: [openButton, playPauseButton, progressSlider, timeLabel, muteButton])
+        controls.translatesAutoresizingMaskIntoConstraints = false
+        controls.orientation = .horizontal
+        controls.spacing = 10
+        controls.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
+        controls.alignment = .centerY
+        controls.wantsLayer = true
+        controls.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
+        controls.layer?.cornerRadius = 12
+
+        root.addSubview(renderView)
+        root.addSubview(controls)
+        renderView.addSubview(overlayLabel)
+        renderView.addSubview(hintLabel)
+
         NSLayoutConstraint.activate([
-            playerView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
-            playerView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
-            playerView.topAnchor.constraint(equalTo: containerView.topAnchor),
-            playerView.bottomAnchor.constraint(equalTo: containerView.bottomAnchor)
+            root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            root.topAnchor.constraint(equalTo: contentView.topAnchor),
+            root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+
+            renderView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            renderView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            renderView.topAnchor.constraint(equalTo: root.topAnchor),
+            renderView.bottomAnchor.constraint(equalTo: controls.topAnchor, constant: -10),
+
+            controls.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            controls.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            controls.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
+            controls.heightAnchor.constraint(equalToConstant: 52),
+
+            progressSlider.widthAnchor.constraint(greaterThanOrEqualToConstant: 240),
+            timeLabel.widthAnchor.constraint(equalToConstant: 108),
+            muteButton.widthAnchor.constraint(equalToConstant: 68),
+            playPauseButton.widthAnchor.constraint(equalToConstant: 68),
+            openButton.widthAnchor.constraint(equalToConstant: 68),
+
+            overlayLabel.centerXAnchor.constraint(equalTo: renderView.centerXAnchor),
+            overlayLabel.centerYAnchor.constraint(equalTo: renderView.centerYAnchor, constant: -12),
+            overlayLabel.leadingAnchor.constraint(greaterThanOrEqualTo: renderView.leadingAnchor, constant: 20),
+            overlayLabel.trailingAnchor.constraint(lessThanOrEqualTo: renderView.trailingAnchor, constant: -20),
+
+            hintLabel.centerXAnchor.constraint(equalTo: renderView.centerXAnchor),
+            hintLabel.topAnchor.constraint(equalTo: overlayLabel.bottomAnchor, constant: 10),
+            hintLabel.leadingAnchor.constraint(greaterThanOrEqualTo: renderView.leadingAnchor, constant: 20),
+            hintLabel.trailingAnchor.constraint(lessThanOrEqualTo: renderView.trailingAnchor, constant: -20)
         ])
 
-        window.contentView = containerView
+        renderView.wantsLayer = true
+        renderView.layer?.backgroundColor = NSColor.black.cgColor
     }
 
-    private func attemptAutoEnterFullScreen() {
-        guard shouldAutoEnterFullScreen, let window else { return }
+    private func bindActions() {
+        openButton.target = self
+        openButton.action = #selector(openDocumentAction)
 
-        if window.styleMask.contains(.fullScreen) {
-            shouldAutoEnterFullScreen = false
-            autoFullScreenAttemptInFlight = false
-            autoFullScreenRetryCount = 0
-            return
-        }
+        playPauseButton.target = self
+        playPauseButton.action = #selector(togglePlayPauseAction)
 
-        guard !autoFullScreenAttemptInFlight, !isFullScreenTransitionInProgress else {
-            return
-        }
+        muteButton.target = self
+        muteButton.action = #selector(toggleMuteAction)
 
-        guard window.isVisible, window.screen != nil, NSApp.isActive else {
-            scheduleAutoFullScreenRetry()
-            return
-        }
+        progressSlider.target = self
+        progressSlider.action = #selector(sliderChanged(_:))
 
-        autoFullScreenAttemptInFlight = true
-        window.toggleFullScreen(nil)
-        scheduleAutoFullScreenVerification()
-    }
-
-    private func scheduleAutoFullScreenRetry() {
-        guard shouldAutoEnterFullScreen, autoFullScreenRetryCount < Defaults.maxAutoFullScreenRetries else {
-            return
-        }
-
-        autoFullScreenRetryCount += 1
-        DispatchQueue.main.asyncAfter(deadline: .now() + Defaults.autoFullScreenRetryDelay) { [weak self] in
-            self?.attemptAutoEnterFullScreen()
+        (window as? PlayerWindow)?.eventHandler = { [weak self] event in
+            self?.handleKey(event) ?? false
         }
     }
 
-    private func scheduleAutoFullScreenVerification() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + Defaults.autoFullScreenVerificationDelay) { [weak self] in
-            guard let self, let window = self.window else { return }
-
-            if window.styleMask.contains(.fullScreen) {
-                self.shouldAutoEnterFullScreen = false
-                self.autoFullScreenAttemptInFlight = false
-                self.autoFullScreenRetryCount = 0
-                return
+    private func setupObservers() {
+        rateObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.updatePlayPauseButton()
             }
+        }
 
-            if self.isFullScreenTransitionInProgress {
-                self.scheduleAutoFullScreenVerification()
-                return
-            }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidChangeOcclusionStateNotification(_:)),
+            name: NSWindow.didChangeOcclusionStateNotification,
+            object: window
+        )
 
-            self.autoFullScreenAttemptInFlight = false
-            self.scheduleAutoFullScreenRetry()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidMiniaturizeNotification(_:)),
+            name: NSWindow.didMiniaturizeNotification,
+            object: window
+        )
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidHide(_:)),
+            name: NSApplication.didHideNotification,
+            object: NSApp
+        )
+
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(systemWillSleep(_:)),
+            name: NSWorkspace.willSleepNotification,
+            object: nil
+        )
+
+        let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
+        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] _ in
+            self?.refreshTimeline()
         }
     }
 
-    private func fittedContentSize(for presentationSize: CGSize, in window: NSWindow) -> NSSize {
-        let visibleFrame = window.screen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-
-        let maxWidth = max(Defaults.minimumContentSize.width, visibleFrame.width * 0.85)
-        let maxHeight = max(Defaults.minimumContentSize.height, visibleFrame.height * 0.85)
-
-        var width = presentationSize.width
-        var height = presentationSize.height
-
-        let scale = min(maxWidth / width, maxHeight / height, 1.0)
-        width *= scale
-        height *= scale
-
-        let aspectRatio = width / height
-        if width < Defaults.minimumContentSize.width {
-            width = Defaults.minimumContentSize.width
-            height = width / aspectRatio
+    private func observeCurrentItem(_ item: AVPlayerItem?) {
+        statusObservation = item?.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch item.status {
+                case .readyToPlay:
+                    self.overlayLabel.isHidden = true
+                    self.hintLabel.isHidden = true
+                    self.refreshTimeline()
+                case .failed:
+                    self.overlayLabel.stringValue = item.error?.localizedDescription ?? "无法打开这个视频"
+                    self.overlayLabel.isHidden = false
+                    self.hintLabel.isHidden = false
+                    self.playPauseButton.title = "播放"
+                default:
+                    break
+                }
+            }
         }
-        if height < Defaults.minimumContentSize.height {
-            height = Defaults.minimumContentSize.height
-            width = height * aspectRatio
+    }
+
+    private func load(url: URL, autoplay: Bool) {
+        let asset = AVURLAsset(
+            url: url,
+            options: [AVURLAssetPreferPreciseDurationAndTimingKey: false]
+        )
+
+        let item = AVPlayerItem(asset: asset)
+        item.preferredForwardBufferDuration = 1
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = false
+        item.audioTimePitchAlgorithm = .varispeed
+
+        player.pause()
+        player.replaceCurrentItem(with: item)
+        observeCurrentItem(item)
+
+        window?.title = url.lastPathComponent
+        window?.representedURL = url
+        progressSlider.doubleValue = 0
+        timeLabel.stringValue = "00:00 / 00:00"
+        overlayLabel.stringValue = "正在载入…"
+        overlayLabel.isHidden = false
+        hintLabel.isHidden = false
+
+        if autoplay {
+            player.play()
+        }
+    }
+
+    private func refreshTimeline() {
+        guard !keepTimeUpdatesSuspended else { return }
+
+        let current = player.currentTime().secondsValue
+        let duration = player.currentItem?.duration.secondsValue ?? 0
+
+        if duration > 0 {
+            progressSlider.doubleValue = min(max(current / duration, 0), 1)
+        } else {
+            progressSlider.doubleValue = 0
         }
 
-        return NSSize(width: round(width), height: round(height))
+        timeLabel.stringValue = "\(format(seconds: current)) / \(format(seconds: duration))"
+    }
+
+    private func updatePlayPauseButton() {
+        let isPlaying = player.timeControlStatus != .paused
+        playPauseButton.title = isPlaying ? "暂停" : "播放"
+    }
+
+    private func updateMuteButton() {
+        muteButton.title = player.isMuted || player.volume <= 0.001 ? "取消静音" : "静音"
+    }
+
+    private func format(seconds: Double) -> String {
+        guard seconds.isFinite, !seconds.isNaN, seconds >= 0 else {
+            return "00:00"
+        }
+
+        let total = Int(seconds.rounded(.down))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, secs)
+        }
+
+        return String(format: "%02d:%02d", minutes, secs)
+    }
+
+    private func handleKey(_ event: NSEvent) -> Bool {
+        switch event.keyCode {
+        case 49:
+            togglePlayPause()
+            return true
+        case 123:
+            seek(by: -5)
+            return true
+        case 124:
+            seek(by: 5)
+            return true
+        case 125:
+            adjustVolume(by: -0.05)
+            return true
+        case 126:
+            adjustVolume(by: 0.05)
+            return true
+        case 3:
+            window?.toggleFullScreen(nil)
+            return true
+        case 46:
+            toggleMute()
+            return true
+        default:
+            return false
+        }
+    }
+
+    @objc private func openDocumentAction() {
+        openDocument()
+    }
+
+    @objc private func togglePlayPauseAction() {
+        togglePlayPause()
+    }
+
+    @objc private func toggleMuteAction() {
+        toggleMute()
+    }
+
+    @objc private func sliderChanged(_ sender: NSSlider) {
+        guard let item = player.currentItem else { return }
+        let duration = item.duration.secondsValue
+        guard duration > 0 else { return }
+
+        keepTimeUpdatesSuspended = true
+        let target = duration * sender.doubleValue
+        let time = CMTime(seconds: target, preferredTimescale: 600)
+        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.keepTimeUpdatesSuspended = false
+                self?.refreshTimeline()
+            }
+        }
+    }
+
+    @objc private func windowDidChangeOcclusionStateNotification(_ notification: Notification) {
+        stopForPowerSavingIfNeeded()
+    }
+
+    @objc private func windowDidMiniaturizeNotification(_ notification: Notification) {
+        player.pause()
+    }
+
+    @objc private func systemWillSleep(_ notification: Notification) {
+        player.pause()
+    }
+
+    @objc private func applicationDidHide(_ notification: Notification) {
+        player.pause()
     }
 }
 
-private final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
-    private let options: CLIOptions
-    private let mediaURL: URL
-
-    private var session: PlaybackSession?
-    private var windowController: PlayerWindowController?
-    private var keyEventMonitor: Any?
-
-    init(options: CLIOptions, mediaURL: URL) {
-        self.options = options
-        self.mediaURL = mediaURL
+private extension CMTime {
+    var secondsValue: Double {
+        let value = CMTimeGetSeconds(self)
+        return value.isFinite && !value.isNaN ? value : 0
     }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var controller: PlayerWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.mainMenu = buildMainMenu()
-
-        let session = PlaybackSession(options: options, mediaURL: mediaURL)
-        let windowController = PlayerWindowController(title: mediaURL.lastPathComponent, session: session)
-
-        session.onPresentationSizeAvailable = { [weak windowController] size in
-            windowController?.applyPreferredWindowSize(for: size)
-        }
-
-        session.onPlaybackFailure = { message in
-            AppState.exitCode = .software
-            StandardIO.writeErrorLine(PlayerError.playerFailed(message).localizedDescription)
-            NSApp.terminate(nil)
-        }
-
-        session.onPlaybackFinished = { [weak self] in
-            guard let self = self, self.options.quitWhenFinished else { return }
-            NSApp.terminate(nil)
-        }
-
-        self.session = session
-        self.windowController = windowController
-
-        installKeyboardShortcuts()
-        windowController.show()
-        NSApp.activate(ignoringOtherApps: true)
-
-        DispatchQueue.main.async { [weak self] in
-            self?.windowController?.enterFullScreenIfNeeded()
-        }
-    }
-
-    func applicationDidBecomeActive(_ notification: Notification) {
-        windowController?.enterFullScreenIfNeeded()
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        if let keyEventMonitor {
-            NSEvent.removeMonitor(keyEventMonitor)
-        }
-        keyEventMonitor = nil
+        controller = PlayerWindowController()
+        controller?.show()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
 
-    @objc
-    private func togglePlayback(_ sender: Any?) {
-        session?.togglePlayback()
+    @objc func openDocument(_ sender: Any?) {
+        controller?.openDocument()
     }
 
-    @objc
-    private func toggleMute(_ sender: Any?) {
-        session?.toggleMute()
+    @objc func togglePlayback(_ sender: Any?) {
+        controller?.togglePlayPause()
     }
 
-    @objc
-    private func seekBackward(_ sender: Any?) {
-        session?.seek(by: -Defaults.seekStepSeconds)
+    @objc func stepForward(_ sender: Any?) {
+        controller?.seek(by: 5)
     }
 
-    @objc
-    private func seekForward(_ sender: Any?) {
-        session?.seek(by: Defaults.seekStepSeconds)
+    @objc func stepBackward(_ sender: Any?) {
+        controller?.seek(by: -5)
     }
 
-    @objc
-    private func toggleFullScreen(_ sender: Any?) {
-        windowController?.toggleFullScreen()
-    }
-
-    @objc
-    private func quit(_ sender: Any?) {
-        NSApp.terminate(nil)
-    }
-
-    private func installKeyboardShortcuts() {
-        guard keyEventMonitor == nil else { return }
-
-        keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self else { return event }
-            return self.handleKeyDown(event)
-        }
-    }
-
-    private func handleKeyDown(_ event: NSEvent) -> NSEvent? {
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        let allowedModifiers = modifiers.subtracting([.numericPad, .function])
-        guard allowedModifiers.isEmpty else { return event }
-
-        switch event.keyCode {
-        case 123:
-            seekBackward(nil)
-            return nil
-        case 124:
-            seekForward(nil)
-            return nil
-        default:
-            break
-        }
-
-        guard let characters = event.charactersIgnoringModifiers?.lowercased() else {
-            return event
-        }
-
-        switch characters {
-        case " ":
-            togglePlayback(nil)
-            return nil
-        case "f":
-            toggleFullScreen(nil)
-            return nil
-        case "q":
-            quit(nil)
-            return nil
-        default:
-            return event
-        }
-    }
-
-    private func buildMainMenu() -> NSMenu {
-        let menu = NSMenu()
-
-        let appMenuItem = NSMenuItem()
-        appMenuItem.submenu = buildApplicationMenu()
-        menu.addItem(appMenuItem)
-
-        let playbackMenuItem = NSMenuItem()
-        playbackMenuItem.submenu = buildPlaybackMenu()
-        menu.addItem(playbackMenuItem)
-
-        return menu
-    }
-
-    private func buildApplicationMenu() -> NSMenu {
-        let menu = NSMenu(title: "Application")
-        let appName = ProcessInfo.processInfo.processName
-
-        let quitItem = NSMenuItem(
-            title: "Quit \(appName)",
-            action: #selector(quit(_:)),
-            keyEquivalent: "q"
-        )
-        quitItem.target = self
-        quitItem.keyEquivalentModifierMask = []
-        menu.addItem(quitItem)
-
-        return menu
-    }
-
-    private func buildPlaybackMenu() -> NSMenu {
-        let menu = NSMenu(title: "Playback")
-
-        let playPauseItem = NSMenuItem(
-            title: "Play/Pause",
-            action: #selector(togglePlayback(_:)),
-            keyEquivalent: " "
-        )
-        playPauseItem.target = self
-        playPauseItem.keyEquivalentModifierMask = []
-        menu.addItem(playPauseItem)
-
-        let muteItem = NSMenuItem(
-            title: "Mute/Unmute",
-            action: #selector(toggleMute(_:)),
-            keyEquivalent: "m"
-        )
-        muteItem.target = self
-        muteItem.keyEquivalentModifierMask = []
-        menu.addItem(muteItem)
-
-        let seekBackwardItem = NSMenuItem(
-            title: "Back 10 Seconds",
-            action: #selector(seekBackward(_:)),
-            keyEquivalent: "["
-        )
-        seekBackwardItem.target = self
-        seekBackwardItem.keyEquivalentModifierMask = []
-        menu.addItem(seekBackwardItem)
-
-        let seekForwardItem = NSMenuItem(
-            title: "Forward 10 Seconds",
-            action: #selector(seekForward(_:)),
-            keyEquivalent: "]"
-        )
-        seekForwardItem.target = self
-        seekForwardItem.keyEquivalentModifierMask = []
-        menu.addItem(seekForwardItem)
-
-        let fullScreenItem = NSMenuItem(
-            title: "Toggle Full Screen",
-            action: #selector(toggleFullScreen(_:)),
-            keyEquivalent: "f"
-        )
-        fullScreenItem.target = self
-        fullScreenItem.keyEquivalentModifierMask = []
-        menu.addItem(fullScreenItem)
-
-        return menu
+    @objc func toggleMute(_ sender: Any?) {
+        controller?.toggleMute()
     }
 }
 
-private func exitCode(for error: PlayerError) -> ExitCode {
-    switch error {
-    case .missingMediaPath,
-         .invalidOption,
-         .missingOptionValue,
-         .invalidVolume,
-         .invalidStartTime,
-         .tooManyPaths:
-        return .usage
-    case .unsupportedURL,
-         .fileNotFound,
-         .directoryNotSupported,
-         .unreadableFile,
-         .unsupportedFileType:
-        return .unavailable
-    case .playerFailed:
-        return .software
-    }
+func makeMenu(delegate: AppDelegate) {
+    let mainMenu = NSMenu()
+
+    let appItem = NSMenuItem()
+    let appMenu = NSMenu()
+    appMenu.addItem(withTitle: "关于播放器", action: nil, keyEquivalent: "")
+    appMenu.addItem(NSMenuItem.separator())
+    appMenu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    appItem.submenu = appMenu
+    mainMenu.addItem(appItem)
+
+    let fileItem = NSMenuItem()
+    let fileMenu = NSMenu(title: "文件")
+    let openItem = NSMenuItem(title: "打开…", action: #selector(AppDelegate.openDocument(_:)), keyEquivalent: "o")
+    openItem.target = delegate
+    fileMenu.addItem(openItem)
+    fileItem.submenu = fileMenu
+    mainMenu.addItem(fileItem)
+
+    let playbackItem = NSMenuItem()
+    let playbackMenu = NSMenu(title: "播放")
+
+    let toggleItem = NSMenuItem(title: "播放/暂停", action: #selector(AppDelegate.togglePlayback(_:)), keyEquivalent: " ")
+    toggleItem.target = delegate
+    playbackMenu.addItem(toggleItem)
+
+    let backItem = NSMenuItem(title: "快退 5 秒", action: #selector(AppDelegate.stepBackward(_:)), keyEquivalent: "[")
+    backItem.target = delegate
+    playbackMenu.addItem(backItem)
+
+    let forwardItem = NSMenuItem(title: "快进 5 秒", action: #selector(AppDelegate.stepForward(_:)), keyEquivalent: "]")
+    forwardItem.target = delegate
+    playbackMenu.addItem(forwardItem)
+
+    let muteItem = NSMenuItem(title: "静音/取消静音", action: #selector(AppDelegate.toggleMute(_:)), keyEquivalent: "m")
+    muteItem.target = delegate
+    playbackMenu.addItem(muteItem)
+
+    playbackItem.submenu = playbackMenu
+    mainMenu.addItem(playbackItem)
+
+    NSApp.mainMenu = mainMenu
 }
 
-do {
-    let programName = (CommandLine.arguments.first as NSString?)?.lastPathComponent ?? "localplayer"
-    let arguments = Array(CommandLine.arguments.dropFirst())
-
-    guard let options = try CLIParser.parse(arguments: arguments) else {
-        StandardIO.writeLine(CLIOptions.usage(programName: programName))
-        Foundation.exit(ExitCode.success.rawValue)
-    }
-
-    let mediaURL = try MediaLocator.resolve(from: options.mediaPath)
-
-    let application = NSApplication.shared
-    application.setActivationPolicy(.regular)
-
-    let coordinator = ApplicationCoordinator(options: options, mediaURL: mediaURL)
-    application.delegate = coordinator
-    application.run()
-
-    Foundation.exit(AppState.exitCode.rawValue)
-} catch let error as PlayerError {
-    StandardIO.writeErrorLine(error.localizedDescription)
-    StandardIO.writeErrorLine("")
-    StandardIO.writeErrorLine(CLIOptions.usage(programName: ProcessInfo.processInfo.processName))
-    Foundation.exit(exitCode(for: error).rawValue)
-} catch {
-    StandardIO.writeErrorLine(error.localizedDescription)
-    Foundation.exit(ExitCode.software.rawValue)
-}
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.setActivationPolicy(.regular)
+app.delegate = delegate
+makeMenu(delegate: delegate)
+app.run()
