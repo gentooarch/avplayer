@@ -156,6 +156,15 @@ private final class RemoteAssetLoader: NSObject, AVAssetResourceLoaderDelegate, 
         let isByteRangeSupported: Bool
     }
 
+    private struct DataRequestInfo {
+        let loadingRequest: AVAssetResourceLoadingRequest
+        let startOffset: Int64
+        let requestedLength: Int
+        let requestsToEnd: Bool
+        var bytesToSkip: Int64
+        var remainingLength: Int?
+    }
+
     private let originalURL: URL
     private let loaderQueue = DispatchQueue(label: "RemoteAssetLoader.queue")
     private lazy var sessionQueue: OperationQueue = {
@@ -174,8 +183,10 @@ private final class RemoteAssetLoader: NSObject, AVAssetResourceLoaderDelegate, 
 
     private var metadata: ContentMetadata?
     private var metadataTaskIdentifier: Int?
+    private var metadataFailure: Error?
+    private var didAttemptMetadataFallback = false
     private var pendingInfoRequests: [AVAssetResourceLoadingRequest] = []
-    private var pendingDataRequests: [Int: AVAssetResourceLoadingRequest] = [:]
+    private var pendingDataRequests: [Int: DataRequestInfo] = [:]
 
     init(originalURL: URL) {
         self.originalURL = originalURL
@@ -224,7 +235,7 @@ private final class RemoteAssetLoader: NSObject, AVAssetResourceLoaderDelegate, 
     func resourceLoader(_ resourceLoader: AVAssetResourceLoader, didCancel loadingRequest: AVAssetResourceLoadingRequest) {
         pendingInfoRequests.removeAll(where: { $0 === loadingRequest })
 
-        if let taskIdentifier = pendingDataRequests.first(where: { $0.value === loadingRequest })?.key {
+        if let taskIdentifier = pendingDataRequests.first(where: { $0.value.loadingRequest === loadingRequest })?.key {
             session.getAllTasks { tasks in
                 tasks.first(where: { $0.taskIdentifier == taskIdentifier })?.cancel()
             }
@@ -233,30 +244,117 @@ private final class RemoteAssetLoader: NSObject, AVAssetResourceLoaderDelegate, 
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        if metadata == nil, let parsedMetadata = makeMetadata(from: response) {
-            metadata = parsedMetadata
-            flushPendingInfoRequestsIfNeeded()
+        if dataTask.taskIdentifier == metadataTaskIdentifier {
+            if let httpResponse = response as? HTTPURLResponse, !isAcceptableMetadataStatus(httpResponse.statusCode) {
+                metadataFailure = makeHTTPError(statusCode: httpResponse.statusCode, url: originalURL)
+                completionHandler(.cancel)
+                return
+            }
+
+            if metadata == nil, let parsedMetadata = makeMetadata(from: response) {
+                metadata = parsedMetadata
+                flushPendingInfoRequestsIfNeeded()
+            }
+
+            completionHandler(.allow)
+            return
         }
 
-        if let loadingRequest = pendingDataRequests[dataTask.taskIdentifier], let metadata {
-            apply(metadata: metadata, to: loadingRequest)
+        if var requestInfo = pendingDataRequests[dataTask.taskIdentifier], let httpResponse = response as? HTTPURLResponse {
+            if let error = validateDataResponse(httpResponse, for: requestInfo.loadingRequest) {
+                pendingDataRequests.removeValue(forKey: dataTask.taskIdentifier)
+                requestInfo.loadingRequest.finishLoading(with: error)
+                completionHandler(.cancel)
+                return
+            }
+
+            configureDataRequestHandling(for: &requestInfo, response: httpResponse)
+            pendingDataRequests[dataTask.taskIdentifier] = requestInfo
+        }
+
+        if let requestInfo = pendingDataRequests[dataTask.taskIdentifier], let metadata {
+            apply(metadata: metadata, to: requestInfo.loadingRequest)
         }
 
         completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        pendingDataRequests[dataTask.taskIdentifier]?.dataRequest?.respond(with: data)
+        guard var requestInfo = pendingDataRequests[dataTask.taskIdentifier] else {
+            return
+        }
+
+        var payload = data
+
+        if requestInfo.bytesToSkip > 0 {
+            if payload.count <= requestInfo.bytesToSkip {
+                requestInfo.bytesToSkip -= Int64(payload.count)
+                pendingDataRequests[dataTask.taskIdentifier] = requestInfo
+                return
+            }
+
+            let skipCount = Int(requestInfo.bytesToSkip)
+            payload = payload.subdata(in: skipCount..<payload.count)
+            requestInfo.bytesToSkip = 0
+        }
+
+        if let remaining = requestInfo.remainingLength {
+            if remaining <= 0 {
+                requestInfo.loadingRequest.finishLoading()
+                pendingDataRequests.removeValue(forKey: dataTask.taskIdentifier)
+                dataTask.cancel()
+                return
+            }
+
+            if payload.count > remaining {
+                payload = payload.subdata(in: 0..<remaining)
+                requestInfo.remainingLength = 0
+            } else {
+                requestInfo.remainingLength = remaining - payload.count
+            }
+        }
+
+        if !payload.isEmpty {
+            requestInfo.loadingRequest.dataRequest?.respond(with: payload)
+        }
+
+        if let remaining = requestInfo.remainingLength, remaining == 0 {
+            requestInfo.loadingRequest.finishLoading()
+            pendingDataRequests.removeValue(forKey: dataTask.taskIdentifier)
+            dataTask.cancel()
+            return
+        }
+
+        pendingDataRequests[dataTask.taskIdentifier] = requestInfo
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if task.taskIdentifier == metadataTaskIdentifier {
             metadataTaskIdentifier = nil
 
-            if let error {
+            let resolvedError = metadataFailure ?? error
+            metadataFailure = nil
+
+            if metadata == nil {
+                if !didAttemptMetadataFallback {
+                    startMetadataFallbackRequest()
+                    return
+                }
+                let finalError = resolvedError ?? makeHTTPError(statusCode: 0, url: originalURL)
                 let requests = pendingInfoRequests
                 pendingInfoRequests.removeAll()
-                requests.forEach { $0.finishLoading(with: error) }
+                requests.forEach { $0.finishLoading(with: finalError) }
+                return
+            }
+
+            if let resolvedError {
+                if !didAttemptMetadataFallback {
+                    startMetadataFallbackRequest()
+                    return
+                }
+                let requests = pendingInfoRequests
+                pendingInfoRequests.removeAll()
+                requests.forEach { $0.finishLoading(with: resolvedError) }
                 return
             }
 
@@ -264,14 +362,14 @@ private final class RemoteAssetLoader: NSObject, AVAssetResourceLoaderDelegate, 
             return
         }
 
-        guard let loadingRequest = pendingDataRequests.removeValue(forKey: task.taskIdentifier) else {
+        guard let requestInfo = pendingDataRequests.removeValue(forKey: task.taskIdentifier) else {
             return
         }
 
         if let error {
-            loadingRequest.finishLoading(with: error)
+            requestInfo.loadingRequest.finishLoading(with: error)
         } else {
-            loadingRequest.finishLoading()
+            requestInfo.loadingRequest.finishLoading()
         }
     }
 
@@ -294,6 +392,21 @@ private final class RemoteAssetLoader: NSObject, AVAssetResourceLoaderDelegate, 
         task.resume()
     }
 
+    private func startMetadataFallbackRequest() {
+        guard metadata == nil, metadataTaskIdentifier == nil else {
+            return
+        }
+
+        didAttemptMetadataFallback = true
+
+        var request = URLRequest(url: originalURL)
+        request.httpMethod = "GET"
+        request.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+        let task = session.dataTask(with: request)
+        metadataTaskIdentifier = task.taskIdentifier
+        task.resume()
+    }
+
     private func startDataRequest(for loadingRequest: AVAssetResourceLoadingRequest) {
         guard let dataRequest = loadingRequest.dataRequest else {
             return
@@ -310,22 +423,32 @@ private final class RemoteAssetLoader: NSObject, AVAssetResourceLoaderDelegate, 
         let startOffset = dataRequest.currentOffset > 0 ? dataRequest.currentOffset : dataRequest.requestedOffset
 
         var request = URLRequest(url: originalURL)
-        if requestsToEnd {
-            request.setValue("bytes=\(startOffset)-", forHTTPHeaderField: "Range")
-        } else {
-            var endOffset = startOffset + Int64(requestedLength) - 1
-            if let metadata, metadata.contentLength > 0 {
-                endOffset = min(endOffset, metadata.contentLength - 1)
+        let supportsByteRanges = metadata?.isByteRangeSupported ?? true
+        if supportsByteRanges {
+            if requestsToEnd {
+                request.setValue("bytes=\(startOffset)-", forHTTPHeaderField: "Range")
+            } else {
+                var endOffset = startOffset + Int64(requestedLength) - 1
+                if let metadata, metadata.contentLength > 0 {
+                    endOffset = min(endOffset, metadata.contentLength - 1)
+                }
+                guard endOffset >= startOffset else {
+                    loadingRequest.finishLoading()
+                    return
+                }
+                request.setValue("bytes=\(startOffset)-\(endOffset)", forHTTPHeaderField: "Range")
             }
-            guard endOffset >= startOffset else {
-                loadingRequest.finishLoading()
-                return
-            }
-            request.setValue("bytes=\(startOffset)-\(endOffset)", forHTTPHeaderField: "Range")
         }
 
         let task = session.dataTask(with: request)
-        pendingDataRequests[task.taskIdentifier] = loadingRequest
+        pendingDataRequests[task.taskIdentifier] = DataRequestInfo(
+            loadingRequest: loadingRequest,
+            startOffset: startOffset,
+            requestedLength: requestedLength,
+            requestsToEnd: requestsToEnd,
+            bytesToSkip: 0,
+            remainingLength: nil
+        )
         task.resume()
     }
 
@@ -386,6 +509,47 @@ private final class RemoteAssetLoader: NSObject, AVAssetResourceLoaderDelegate, 
             contentLength: resolvedLength,
             isByteRangeSupported: byteRangeSupported
         )
+    }
+
+    private func isAcceptableMetadataStatus(_ statusCode: Int) -> Bool {
+        (200...299).contains(statusCode)
+    }
+
+    private func validateDataResponse(_ response: HTTPURLResponse, for loadingRequest: AVAssetResourceLoadingRequest) -> Error? {
+        guard loadingRequest.dataRequest != nil else {
+            return nil
+        }
+
+        let statusCode = response.statusCode
+        guard (200...299).contains(statusCode) else {
+            return makeHTTPError(statusCode: statusCode, url: originalURL)
+        }
+
+        return nil
+    }
+
+    private func configureDataRequestHandling(for requestInfo: inout DataRequestInfo, response: HTTPURLResponse) {
+        guard response.statusCode == 200 else {
+            return
+        }
+
+        if requestInfo.startOffset > 0 {
+            requestInfo.bytesToSkip = requestInfo.startOffset
+        }
+
+        if !requestInfo.requestsToEnd {
+            requestInfo.remainingLength = requestInfo.requestedLength
+        }
+    }
+
+    private func makeHTTPError(statusCode: Int, url: URL) -> NSError {
+        let message: String
+        if statusCode == 0 {
+            message = "Unable to load metadata for \(url.absoluteString)."
+        } else {
+            message = "Server returned HTTP \(statusCode) for \(url.absoluteString)."
+        }
+        return NSError(domain: "RemoteAssetLoader", code: statusCode, userInfo: [NSLocalizedDescriptionKey: message])
     }
 }
 
